@@ -6,6 +6,44 @@ import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
 import { getOpenAIContextWindow, getOpenAIMaxOutputTokens } from './model/openaiContextWindows.js'
 
+const VALID_CONTEXT_SUFFIXES = {
+  '8k': 8_000,
+  '16k': 16_000,
+  '32k': 32_000,
+  '64k': 64_000,
+  '128k': 128_000,
+  '256k': 256_000,
+  '512k': 512_000,
+  '1m': 1_000_000,
+} as const
+
+type ContextSuffix = keyof typeof VALID_CONTEXT_SUFFIXES
+
+const SUFFIX_PATTERN = /^(.*)\[(8k|16k|32k|64k|128k|256k|512k|1m)\]$/i
+
+export type ParsedModelContext = {
+  model: string
+  contextWindow: number | null
+}
+
+/**
+ * Parse [size] suffix from model string. Returns the base model
+ * and optional context window in tokens. e.g. "qwen3.6-plus:free[512k]" →
+ * { model: "qwen3.6-plus:free", contextWindow: 512000 }.
+ */
+export function parseModelContextSuffix(input: string): ParsedModelContext {
+  const match = input.match(SUFFIX_PATTERN)
+  if (!match) {
+    return { model: input, contextWindow: null }
+  }
+  const baseModel = match[1]
+  const suffix = match[2].toLowerCase() as ContextSuffix
+  return {
+    model: baseModel,
+    contextWindow: VALID_CONTEXT_SUFFIXES[suffix] ?? null,
+  }
+}
+
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
 
@@ -70,6 +108,12 @@ export function getContextWindowForModel(
   // [1m] suffix — explicit client-side opt-in, respected over all detection
   if (has1mContext(model)) {
     return 1_000_000
+  }
+
+  // [size] suffix override — e.g. qwen3.6-plus:free[512k] → 512,000 tokens
+  const parsed = parseModelContextSuffix(model)
+  if (parsed.contextWindow) {
+    return parsed.contextWindow
   }
 
   // OpenAI-compatible provider — use known context windows for the model
