@@ -367,3 +367,25 @@ test('disables local toolless retry for non-Ollama local endpoints', () => {
     }),
   ).toBe(false)
 })
+
+test('cline mode defaults to cline endpoint and namespaces the model', () => {
+  process.env.CLAUDE_CODE_USE_CLINE = '1'
+  process.env.CLINE_MODEL_TYPE = 'cline-pass'
+  delete process.env.OPENAI_BASE_URL
+  delete process.env.OPENAI_MODEL
+  delete process.env.CLINE_MODEL
+  try {
+    expect(resolveProviderRequest({ model: 'glm-5.2' })).toMatchObject({
+      transport: 'chat_completions',
+      requestedModel: 'glm-5.2',
+      resolvedModel: 'cline-pass/glm-5.2',
+      baseUrl: 'https://api.cline.bot/api/v1',
+    })
+    expect(resolveProviderRequest({ model: 'cline-pass/deepseek-v4-pro' }).resolvedModel).toBe(
+      'cline-pass/deepseek-v4-pro',
+    )
+  } finally {
+    delete process.env.CLAUDE_CODE_USE_CLINE
+    delete process.env.CLINE_MODEL_TYPE
+  }
+})

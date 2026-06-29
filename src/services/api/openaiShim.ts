@@ -38,6 +38,7 @@ import {
 } from '../../utils/codexCredentials.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isBareMode, isEnvTruthy } from '../../utils/envUtils.js'
+import { isClineMode, resolveClineBearer } from './clineAuth.js'
 import {
   resolveModelReasoningControl,
   resolveOpenAIShimReasoningRequestPlan,
@@ -3510,6 +3511,9 @@ class OpenAIShimMessages {
       !openAIApiKey
         ? await resolveXaiAccessToken()
         : undefined
+    // Cline subscription: resolve a fresh `workos:` bearer per request,
+    // refreshing the WorkOS token when it nears expiry.
+    const clineBearer = isClineMode() ? await resolveClineBearer() : undefined
     const openAIApiKeyIsCopiedProviderKey =
       Boolean(
         openAIApiKeyRawUsable &&
@@ -3548,6 +3552,7 @@ class OpenAIShimMessages {
         routeCredential === openAIApiKeyRawUsable,
       )
     const apiKeyRaw =
+      clineBearer ??
       this.providerOverride?.apiKey ??
       (openAIApiKeyIsCopiedProviderKey ? openAIApiKeyRawUsable : undefined) ??
       (routeCredentialIsGenericOpenAIFallback ? undefined : routeCredential) ??
