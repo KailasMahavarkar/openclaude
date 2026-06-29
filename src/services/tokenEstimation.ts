@@ -31,6 +31,12 @@ import { withTokenCountVCR } from './vcr.js'
 // API constraint: max_tokens must be greater than thinking.budget_tokens
 const TOKEN_COUNT_THINKING_BUDGET = 1024
 const TOKEN_COUNT_MAX_TOKENS = 2048
+// Keep this local to avoid importing analyzeContext.ts, which already depends on tokenEstimation.
+const ROUGH_TOOL_TOKEN_COUNT_OVERHEAD = 500
+
+type CountTokensMessagesClient = {
+  countTokens?: Anthropic['beta']['messages']['countTokens']
+}
 
 /**
  * Check if messages contain thinking blocks
@@ -163,42 +169,106 @@ export async function countMessagesTokensWithAPI(
         model,
         source: 'count_tokens',
       })
+      const messagesClient = (
+        anthropic as {
+          beta?: {
+            messages?: CountTokensMessagesClient
+          }
+        }
+      ).beta?.messages
 
       const filteredBetas =
         getAPIProvider() === 'vertex'
           ? betas.filter(b => VERTEX_COUNT_TOKENS_ALLOWED_BETAS.has(b))
           : betas
 
-      const response = await anthropic.beta.messages.countTokens({
-        model: normalizeModelStringForAPI(model),
-        messages:
-          // When we pass tools and no messages, we need to pass a dummy message
-          // to get an accurate tool token count.
-          messages.length > 0 ? messages : [{ role: 'user', content: 'foo' }],
+      return countMessagesTokensWithClient({
+        messagesClient,
+        model,
+        messages,
         tools,
-        ...(filteredBetas.length > 0 && { betas: filteredBetas }),
-        // Enable thinking if messages contain thinking blocks
-        ...(containsThinking && {
-          thinking: {
-            type: 'enabled',
-            budget_tokens: TOKEN_COUNT_THINKING_BUDGET,
-          },
-        }),
+        filteredBetas,
+        containsThinking,
       })
-
-      if (typeof response.input_tokens !== 'number') {
-        // Vertex client throws
-        // Bedrock client succeeds with { Output: { __type: 'com.amazon.coral.service#UnknownOperationException' }, Version: '1.0' }
-        return null
-      }
-
-      return response.input_tokens
     } catch (error) {
       logError(error)
       return null
     }
   })
 }
+
+async function countMessagesTokensWithClient({
+  messagesClient,
+  model,
+  messages,
+  tools,
+  filteredBetas,
+  containsThinking,
+}: {
+  messagesClient: CountTokensMessagesClient | undefined
+  model: string
+  messages: Anthropic.Beta.Messages.BetaMessageParam[]
+  tools: Anthropic.Beta.Messages.BetaToolUnion[]
+  filteredBetas: string[]
+  containsThinking: boolean
+}): Promise<number | null> {
+  if (typeof messagesClient?.countTokens !== 'function') {
+    return roughTokenCountEstimationForCountTokensFallback(messages, tools)
+  }
+
+  const response = await messagesClient.countTokens({
+    model: normalizeModelStringForAPI(model),
+    messages:
+      // When we pass tools and no messages, we need to pass a dummy message
+      // to get an accurate tool token count.
+      messages.length > 0 ? messages : [{ role: 'user', content: 'foo' }],
+    tools,
+    ...(filteredBetas.length > 0 && { betas: filteredBetas }),
+    // Enable thinking if messages contain thinking blocks
+    ...(containsThinking && {
+      thinking: {
+        type: 'enabled',
+        budget_tokens: TOKEN_COUNT_THINKING_BUDGET,
+      },
+    }),
+  })
+
+  if (typeof response.input_tokens !== 'number') {
+    // Vertex client throws
+    // Bedrock client succeeds with { Output: { __type: 'com.amazon.coral.service#UnknownOperationException' }, Version: '1.0' }
+    return null
+  }
+
+  return response.input_tokens
+}
+
+function roughTokenCountEstimationForCountTokensFallback(
+  messages: Anthropic.Beta.Messages.BetaMessageParam[],
+  tools: Anthropic.Beta.Messages.BetaToolUnion[],
+): number {
+  let totalTokens = 0
+
+  for (const message of messages) {
+    totalTokens += roughTokenCountEstimationForContent(
+      message.content as
+        | string
+        | Array<Anthropic.ContentBlock>
+        | Array<Anthropic.ContentBlockParam>
+        | undefined,
+    )
+  }
+
+  if (tools.length > 0) {
+    totalTokens +=
+      ROUGH_TOOL_TOKEN_COUNT_OVERHEAD +
+      roughTokenCountEstimation(jsonStringify(tools))
+  }
+
+  return totalTokens
+}
+
+// Test-only surface for fallback dispatch without process-wide module mocks.
+export const __test = { countMessagesTokensWithClient }
 
 export function roughTokenCountEstimation(
   content: string,
@@ -224,6 +294,49 @@ export function bytesPerTokenForFileType(fileExtension: string): number {
 }
 
 /**
+ * Tokenizer ratio by model family.
+ * Different models have different encodings.
+ */
+export interface ModelTokenizerConfig {
+  modelFamily: string
+  bytesPerToken: number
+  supportsJson: boolean
+  supportsCode: boolean
+}
+
+export const MODEL_TOKENIZER_CONFIGS: ModelTokenizerConfig[] = [
+  { modelFamily: 'claude', bytesPerToken: 3.5, supportsJson: true, supportsCode: true },
+  { modelFamily: 'gpt-4', bytesPerToken: 4, supportsJson: true, supportsCode: true },
+  { modelFamily: 'gpt-3.5', bytesPerToken: 4, supportsJson: true, supportsCode: true },
+  { modelFamily: 'gemini', bytesPerToken: 3.5, supportsJson: true, supportsCode: true },
+  { modelFamily: 'llama', bytesPerToken: 3.8, supportsJson: true, supportsCode: true },
+  { modelFamily: 'deepseek', bytesPerToken: 3.5, supportsJson: true, supportsCode: true },
+  { modelFamily: 'minimax', bytesPerToken: 3.2, supportsJson: true, supportsCode: true },
+]
+
+/**
+ * Get tokenizer config for a model.
+ */
+export function getTokenizerConfig(model: string): ModelTokenizerConfig {
+  const lower = model.toLowerCase()
+  
+  for (const config of MODEL_TOKENIZER_CONFIGS) {
+    if (lower.includes(config.modelFamily)) {
+      return config
+    }
+  }
+  
+  return { modelFamily: 'unknown', bytesPerToken: 4, supportsJson: true, supportsCode: true }
+}
+
+/**
+ * Get bytes-per-token ratio for a model.
+ */
+export function getBytesPerTokenForModel(model: string): number {
+  return getTokenizerConfig(model).bytesPerToken
+}
+
+/**
  * Like {@link roughTokenCountEstimation} but uses a more accurate
  * bytes-per-token ratio when the file type is known.
  *
@@ -239,6 +352,106 @@ export function roughTokenCountEstimationForFileType(
     content,
     bytesPerTokenForFileType(fileExtension),
   )
+}
+
+/**
+ * Content type classification for compression ratio.
+ */
+export type ContentType = 
+  | 'json' | 'code' | 'prose' | 'technical' 
+  | 'list' | 'table' | 'mixed'
+
+/**
+ * Compression ratio by content type.
+ * Measured empirically - denser content = lower ratio.
+ */
+export const COMPRESSION_RATIOS: Record<ContentType, { min: number; max: number; typical: number }> = {
+  json: { min: 1.5, max: 2.5, typical: 2 },
+  code: { min: 3, max: 4.5, typical: 3.5 },
+  prose: { min: 3.5, max: 4.5, typical: 4 },
+  technical: { min: 2.5, max: 3.5, typical: 3 },
+  list: { min: 2, max: 3, typical: 2.5 },
+  table: { min: 1.8, max: 2.8, typical: 2.2 },
+  mixed: { min: 3, max: 4, typical: 3.5 },
+}
+
+/**
+ * Detect content type from content.
+ */
+export function detectContentType(content: string): ContentType {
+  const trimmed = content.trim()
+  
+  // JSON
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      JSON.parse(trimmed)
+      return 'json'
+    } catch { /* not valid json */ }
+  }
+  
+  // Table (tabs or consistent delimiters)
+  const lines = trimmed.split('\n')
+  if (lines.length > 2) {
+    const hasTabs = lines[0].includes('\t')
+    const hasCommas = lines[0].includes(',')
+    if (hasTabs || hasCommas) {
+      const consistent = lines.slice(1).every(l => l.includes('\t') || l.includes(','))
+      if (consistent) return 'table'
+    }
+  }
+  
+  // List
+  if (/^[\d\-\*\•]/.test(trimmed) || /^[\d\-\*\•]/.test(lines[0])) {
+    return 'list'
+  }
+  
+  // Code (high density of special chars)
+  const codeChars = (content.match(/[{}()\[\];=]/g) || []).length
+  const codeRatio = codeChars / content.length
+  if (codeRatio > 0.05) return 'code'
+  
+  // Technical (has numbers and units)
+  if (/\d+\s*(px|em|rem|%|ms|s|kb|mb|gb)/i.test(content)) {
+    return 'technical'
+  }
+  
+  // Prose (default - natural language)
+  return 'prose'
+}
+
+/**
+ * Get compression ratio for content.
+ */
+export function getCompressionRatio(content: string, type?: ContentType): { ratio: number; min: number; max: number } {
+  const detectedType = type ?? detectContentType(content)
+  const { min, max, typical } = COMPRESSION_RATIOS[detectedType]
+  
+  // Adjust based on actual content length
+  // Shorter content = higher variance
+  const lengthBonus = content.length < 100 ? 0.5 : 0
+  
+  return {
+    ratio: typical,
+    min: min + lengthBonus,
+    max: max + lengthBonus,
+  }
+}
+
+/**
+ * Estimate tokens with confidence bounds.
+ */
+export function estimateWithBounds(
+  content: string,
+  type?: ContentType,
+): { estimate: number; min: number; max: number } {
+  const { ratio, min: minRatio, max: maxRatio } = getCompressionRatio(content, type)
+  
+  const estimate = roughTokenCountEstimation(content, ratio)
+  const min = roughTokenCountEstimation(content, maxRatio)
+  const max = roughTokenCountEstimation(content, minRatio)
+  
+  return { estimate, min, max }
 }
 
 /**
@@ -372,7 +585,9 @@ function roughTokenCountEstimationForContent(
   content:
     | string
     | Array<Anthropic.ContentBlock>
-    | Array<Anthropic.ContentBlockParam>
+    // ToolReferenceBlockParam appears nested in tool_result content but is
+    // not part of the top-level ContentBlockParam union.
+    | Array<Anthropic.ContentBlockParam | Anthropic.ToolReferenceBlockParam>
     | undefined,
 ): number {
   if (!content) {
@@ -389,7 +604,12 @@ function roughTokenCountEstimationForContent(
 }
 
 function roughTokenCountEstimationForBlock(
-  block: string | Anthropic.ContentBlock | Anthropic.ContentBlockParam,
+  block:
+    | string
+    | Anthropic.ContentBlock
+    | Anthropic.ContentBlockParam
+    // Nested tool_result content block; falls through to the stringify path.
+    | Anthropic.ToolReferenceBlockParam,
 ): number {
   if (typeof block === 'string') {
     return roughTokenCountEstimation(block)

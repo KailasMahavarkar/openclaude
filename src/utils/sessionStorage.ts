@@ -25,12 +25,11 @@ import {
   getOriginalCwd,
   getPlanSlugCache,
   getPromptId,
+  getReplayIndexBuilder,
   getSessionId,
   getSessionProjectDir,
-  isSessionPersistenceDisabled,
   switchSession,
 } from '../bootstrap/state.js'
-import { builtInCommandNames } from '../commands.js'
 import { COMMAND_NAME_TAG, TICK_TAG } from '../constants/xml.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
 import * as sessionIngress from '../services/api/sessionIngress.js'
@@ -48,9 +47,11 @@ import {
   type ContextCollapseSnapshotEntry,
   type Entry,
   type FileHistorySnapshotMessage,
+  type GoalStateEntry,
   type LogOption,
   type PersistedWorktreeSession,
   type SerializedMessage,
+  type SessionBranchEntry,
   sortLogs,
   type TranscriptMessage,
 } from '../types/logs.js'
@@ -69,7 +70,7 @@ import { updateSessionName } from './concurrentSessions.js'
 import { getCwd } from './cwd.js'
 import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
-import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
+import { getClaudeConfigHomeDir, getProjectsDir, isEnvTruthy } from './envUtils.js'
 import { isFsInaccessible } from './errors.js'
 import type { FileHistorySnapshot } from './fileHistory.js'
 import { formatFileSize } from './format.js'
@@ -89,7 +90,7 @@ import {
   readTranscriptForLoad,
   SKIP_PRECOMPACT_THRESHOLD,
 } from './sessionStoragePortable.js'
-import { getSettings_DEPRECATED } from './settings/settings.js'
+import { shouldSkipSessionPersistence } from './sessionPersistencePolicy.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 import type { ContentReplacementRecord } from './toolResultStorage.js'
 import { validateUuid } from './uuid.js'
@@ -97,6 +98,17 @@ import { validateUuid } from './uuid.js'
 // Cache MACRO.VERSION at module level to work around bun --define bug in async contexts
 // See: https://github.com/oven-sh/bun/issues/26168
 const VERSION = typeof MACRO !== 'undefined' ? MACRO.VERSION : 'unknown'
+
+let builtInCommandNamesCache: Set<string> | undefined
+
+function getBuiltInCommandNames(): Set<string> {
+  if (builtInCommandNamesCache) return builtInCommandNamesCache
+  const commands =
+    require('../commands.js') as typeof import('../commands.js')
+  const names = commands.builtInCommandNames()
+  builtInCommandNamesCache = names
+  return names
+}
 
 type Transcript = (
   | UserMessage
@@ -193,10 +205,6 @@ const EPHEMERAL_PROGRESS_TYPES = new Set([
 ])
 export function isEphemeralToolProgress(dataType: unknown): boolean {
   return typeof dataType === 'string' && EPHEMERAL_PROGRESS_TYPES.has(dataType)
-}
-
-export function getProjectsDir(): string {
-  return join(getClaudeConfigHomeDir(), 'projects')
 }
 
 export function getTranscriptPath(): string {
@@ -459,6 +467,23 @@ function getProject(): Project {
         } catch {
           // Best-effort — don't let metadata re-append crash the cleanup
         }
+
+        try {
+          const { resetAllReplayIndexBuilders } = await import('src/bootstrap/state.js')
+          const replayBuilders = resetAllReplayIndexBuilders()
+          if (!shouldSkipSessionPersistence()) {
+            const { writeReplayIndex } = await import('./replayIndex.js')
+            for (const { sessionId, builder, projectDir } of replayBuilders) {
+              const transcriptPath = projectDir
+                ? join(projectDir, `${sessionId}.jsonl`)
+                : getTranscriptPathForSession(sessionId)
+              const index = builder.build(sessionId)
+              await writeReplayIndex(sessionId, transcriptPath, index)
+            }
+          }
+        } catch {
+          // Best-effort — don't let replay index cleanup crash shutdown
+        }
       })
       cleanupRegistered = true
     }
@@ -545,6 +570,7 @@ class Project {
   currentSessionPrNumber: number | undefined
   currentSessionPrUrl: string | undefined
   currentSessionPrRepository: string | undefined
+  currentSessionGoal: GoalStateEntry['goal'] | undefined
 
   sessionFile: string | null = null
   // Entries buffered while sessionFile is null. Flushed by materializeSessionFile
@@ -836,6 +862,17 @@ class Project {
         timestamp: new Date().toISOString(),
       })
     }
+    if (
+      this.currentSessionGoal &&
+      (this.currentSessionGoal.status === 'active' ||
+        this.currentSessionGoal.status === 'paused')
+    ) {
+      appendEntryToFile(this.sessionFile, {
+        type: 'goal-state',
+        sessionId,
+        goal: this.currentSessionGoal,
+      })
+    }
   }
 
   async flush(): Promise<void> {
@@ -958,15 +995,7 @@ class Project {
    * test sessions don't pollute the user's --resume list.
    */
   private shouldSkipPersistence(): boolean {
-    const allowTestPersistence = isEnvTruthy(
-      process.env.TEST_ENABLE_SESSION_PERSISTENCE,
-    )
-    return (
-      (getNodeEnv() === 'test' && !allowTestPersistence) ||
-      getSettings_DEPRECATED()?.cleanupPeriodDays === 0 ||
-      isSessionPersistenceDisabled() ||
-      isEnvTruthy(process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY)
-    )
+    return shouldSkipSessionPersistence()
   }
 
   /**
@@ -1063,6 +1092,47 @@ class Project {
           slug,
         }
         await this.appendEntry(transcriptMessage)
+        const shouldTrackReplay = !this.shouldSkipPersistence()
+        if (shouldTrackReplay && !isSidechain && message.type === 'user') {
+          const content = getFirstMeaningfulUserMessageTextContent([message])
+          if (content) {
+            try {
+              getReplayIndexBuilder().trackUserMessage(
+                content,
+                message.timestamp ?? new Date().toISOString(),
+              )
+            } catch {
+              // Replay tracking is best-effort and must not affect transcript writes.
+            }
+          }
+        }
+        if (shouldTrackReplay && !isSidechain && message.type === 'system') {
+          try {
+            if (message.subtype === 'api_error') {
+              getReplayIndexBuilder().trackRetry(
+                'api',
+                message.error.message || `API error ${message.error.status ?? ''}`.trim(),
+                message.timestamp ?? new Date().toISOString(),
+                {
+                  attempt: message.retryAttempt,
+                  maxRetries: message.maxRetries,
+                  retryDelayMs: message.retryInMs,
+                },
+              )
+            } else if (message.subtype === 'permission_retry') {
+              getReplayIndexBuilder().trackRetry(
+                'permission',
+                message.content,
+                message.timestamp ?? new Date().toISOString(),
+                {
+                  commands: message.commands,
+                },
+              )
+            }
+          } catch {
+            // Replay tracking is best-effort and must not affect transcript writes.
+          }
+        }
         if (isChainParticipant(message)) {
           parentUuid = message.uuid
         }
@@ -1122,6 +1192,20 @@ class Project {
         replacements,
       }
       await this.appendEntry(entry)
+    })
+  }
+
+  async insertGoalState(goal: GoalStateEntry['goal'], sessionId: UUID) {
+    return this.trackWrite(async () => {
+      const entry: GoalStateEntry = {
+        type: 'goal-state',
+        sessionId,
+        goal,
+      }
+      if (sessionId === getSessionId()) {
+        this.currentSessionGoal = goal ?? undefined
+      }
+      await this.appendEntry(entry, sessionId)
     })
   }
 
@@ -1205,6 +1289,10 @@ class Project {
         ? getAgentTranscriptPath(entry.agentId)
         : sessionFile
       void this.enqueueWrite(targetFile, entry)
+    } else if (entry.type === 'goal-state') {
+      await this.appendToFile(sessionFile, jsonStringify(entry) + '\n')
+    } else if (entry.type === 'session-branch') {
+      void this.enqueueWrite(sessionFile, entry)
     } else if (entry.type === 'marble-origami-commit') {
       // Always append. Commit order matters for restore (later commits may
       // reference earlier commits' summary messages), so these must be
@@ -1218,7 +1306,7 @@ class Project {
       if (entry.type === 'queue-operation') {
         // Queue operations are always appended to the session file
         void this.enqueueWrite(sessionFile, entry)
-      } else {
+      } else if (isTranscriptMessage(entry)) {
         // At this point, entry must be a TranscriptMessage (user/assistant/attachment/system)
         // All other entry types have been handled above
         const isAgentSidechain =
@@ -1260,6 +1348,13 @@ class Project {
             }
           }
         }
+      } else {
+        const entryType = (entry as { type?: string }).type ?? 'unknown'
+        // Exhaustiveness guard: entry is never here when every Entry variant
+        // has an append policy above.
+        const _exhaustive: never = entry
+        void _exhaustive
+        throw new Error(`Unhandled session storage entry type: ${entryType}`)
       }
     }
   }
@@ -1498,6 +1593,13 @@ export async function recordContentReplacement(
   await getProject().insertContentReplacement(replacements, agentId)
 }
 
+export async function recordGoalState(
+  goal: GoalStateEntry['goal'],
+  sessionId: UUID = getSessionId() as UUID,
+) {
+  await getProject().insertGoalState(goal, sessionId)
+}
+
 /**
  * Reset the session file pointer after switchSession/regenerateSessionId.
  * The new file is created lazily on the first user/assistant message.
@@ -1545,6 +1647,7 @@ export async function recordContextCollapseCommit(commit: {
   summary: string
   firstArchivedUuid: string
   lastArchivedUuid: string
+  archivedCount: number
 }): Promise<void> {
   const sessionId = getSessionId() as UUID
   if (!sessionId) return
@@ -1778,7 +1881,7 @@ export function getFirstMeaningfulUserMessageTextContent<T extends Message>(
 
         // If it's a built-in command, then it's unlikely to provide
         // meaningful context (e.g. `/model sonnet`)
-        if (builtInCommandNames().has(commandName)) {
+        if (getBuiltInCommandNames().has(commandName)) {
           continue
         } else {
           // Otherwise, for custom commands, then keep it only if it has
@@ -1939,7 +2042,8 @@ function applyPreservedSegmentRelinks(
         tailIndex: entryIndex.get(lastSeg.tailUuid),
         headIndex: entryIndex.get(lastSeg.headUuid),
         anchorIndex: entryIndex.get(lastSeg.anchorUuid),
-        lastSeenType,
+        lastSeenType:
+          lastSeenType as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         breakParentInTranscript: Boolean(
           breakParentUuid && messages.has(breakParentUuid),
         ),
@@ -2558,6 +2662,8 @@ export async function loadTranscriptFromFile(
       leafUuids,
       contentReplacements,
       worktreeStates,
+      goalStates,
+      sessionBranches,
     } = await loadTranscriptFile(filePath)
 
     if (messages.size === 0) {
@@ -2603,6 +2709,8 @@ export async function loadTranscriptFromFile(
       worktreeSession: worktreeStates.has(sessionId)
         ? worktreeStates.get(sessionId)
         : undefined,
+      goal: goalStates.get(sessionId),
+      sessionBranch: sessionBranches.get(sessionId),
     }
   }
 
@@ -3017,6 +3125,7 @@ export function restoreSessionMetadata(meta: {
   prNumber?: number
   prUrl?: string
   prRepository?: string
+  goal?: GoalStateEntry['goal']
 }): void {
   const project = getProject()
   // ??= so --name (cacheSessionTitle) wins over the resumed
@@ -3033,6 +3142,10 @@ export function restoreSessionMetadata(meta: {
     project.currentSessionPrNumber = meta.prNumber
   if (meta.prUrl) project.currentSessionPrUrl = meta.prUrl
   if (meta.prRepository) project.currentSessionPrRepository = meta.prRepository
+  // Unlike display-only metadata, absence of a goal-state entry means this
+  // resumed session has no goal. Clear any cached goal so adopt/re-append
+  // cannot persist a previous session's active goal into this transcript.
+  project.currentSessionGoal = meta.goal ?? undefined
 }
 
 /**
@@ -3053,6 +3166,7 @@ export function clearSessionMetadata(): void {
   project.currentSessionPrNumber = undefined
   project.currentSessionPrUrl = undefined
   project.currentSessionPrRepository = undefined
+  project.currentSessionGoal = undefined
 }
 
 /**
@@ -3226,6 +3340,8 @@ export async function loadFullLog(log: LogOption): Promise<LogOption> {
       fileHistorySnapshots,
       attributionSnapshots,
       contentReplacements,
+      goalStates,
+      sessionBranches,
       contextCollapseCommits,
       contextCollapseSnapshot,
       leafUuids,
@@ -3289,6 +3405,10 @@ export async function loadFullLog(log: LogOption): Promise<LogOption> {
       contentReplacements: sessionId
         ? (contentReplacements.get(sessionId) ?? [])
         : log.contentReplacements,
+      goal: sessionId ? goalStates.get(sessionId) : log.goal,
+      sessionBranch: sessionId
+        ? (sessionBranches.get(sessionId) ?? log.sessionBranch)
+        : log.sessionBranch,
       // Filter to the resumed session's entries. loadTranscriptFile reads
       // the file sequentially so the array is already in commit order;
       // filter preserves that.
@@ -3371,9 +3491,11 @@ const METADATA_TYPE_MARKERS = [
   '"type":"mode"',
   '"type":"worktree-state"',
   '"type":"pr-link"',
+  '"type":"goal-state"',
+  '"type":"session-branch"',
 ]
 const METADATA_MARKER_BUFS = METADATA_TYPE_MARKERS.map(m => Buffer.from(m))
-// Longest marker is 22 bytes; +1 for leading `{` = 23.
+// Longest marker plus the leading `{` fits within this bound.
 const METADATA_PREFIX_BOUND = 25
 
 // null = carry spans whole chunk. Skips concat when carry provably isn't
@@ -3740,6 +3862,8 @@ export async function loadTranscriptFile(
   attributionSnapshots: Map<UUID, AttributionSnapshotMessage>
   contentReplacements: Map<UUID, ContentReplacementRecord[]>
   agentContentReplacements: Map<AgentId, ContentReplacementRecord[]>
+  goalStates: Map<UUID, GoalStateEntry['goal']>
+  sessionBranches: Map<UUID, SessionBranchEntry>
   contextCollapseCommits: ContextCollapseCommitEntry[]
   contextCollapseSnapshot: ContextCollapseSnapshotEntry | undefined
   leafUuids: Set<UUID>
@@ -3763,6 +3887,8 @@ export async function loadTranscriptFile(
     AgentId,
     ContentReplacementRecord[]
   >()
+  const goalStates = new Map<UUID, GoalStateEntry['goal']>()
+  const sessionBranches = new Map<UUID, SessionBranchEntry>()
   // Array, not Map — commit order matters (nested collapses).
   const contextCollapseCommits: ContextCollapseCommitEntry[] = []
   // Last-wins — later entries supersede.
@@ -3862,6 +3988,10 @@ export async function loadTranscriptFile(
           prNumbers.set(entry.sessionId, entry.prNumber)
           prUrls.set(entry.sessionId, entry.prUrl)
           prRepositories.set(entry.sessionId, entry.prRepository)
+        } else if (entry.type === 'goal-state' && entry.sessionId) {
+          goalStates.set(entry.sessionId, entry.goal)
+        } else if (entry.type === 'session-branch' && entry.sessionId) {
+          sessionBranches.set(entry.sessionId, entry)
         }
       })
     }
@@ -3926,6 +4056,10 @@ export async function loadTranscriptFile(
         prNumbers.set(entry.sessionId, entry.prNumber)
         prUrls.set(entry.sessionId, entry.prUrl)
         prRepositories.set(entry.sessionId, entry.prRepository)
+      } else if (entry.type === 'goal-state' && entry.sessionId) {
+        goalStates.set(entry.sessionId, entry.goal)
+      } else if (entry.type === 'session-branch' && entry.sessionId) {
+        sessionBranches.set(entry.sessionId, entry)
       } else if (entry.type === 'file-history-snapshot') {
         fileHistorySnapshots.set(entry.messageId, entry)
       } else if (entry.type === 'attribution-snapshot') {
@@ -4062,6 +4196,8 @@ export async function loadTranscriptFile(
     attributionSnapshots,
     contentReplacements,
     agentContentReplacements,
+    goalStates,
+    sessionBranches,
     contextCollapseCommits,
     contextCollapseSnapshot,
     leafUuids,
@@ -4081,6 +4217,8 @@ async function loadSessionFile(sessionId: UUID): Promise<{
   fileHistorySnapshots: Map<UUID, FileHistorySnapshotMessage>
   attributionSnapshots: Map<UUID, AttributionSnapshotMessage>
   contentReplacements: Map<UUID, ContentReplacementRecord[]>
+  goalStates: Map<UUID, GoalStateEntry['goal']>
+  sessionBranches: Map<UUID, SessionBranchEntry>
   contextCollapseCommits: ContextCollapseCommitEntry[]
   contextCollapseSnapshot: ContextCollapseSnapshotEntry | undefined
 }> {
@@ -4136,6 +4274,8 @@ export async function getLastSessionLog(
     fileHistorySnapshots,
     attributionSnapshots,
     contentReplacements,
+    goalStates,
+    sessionBranches,
     contextCollapseCommits,
     contextCollapseSnapshot,
   } = await loadSessionFile(sessionId)
@@ -4177,6 +4317,8 @@ export async function getLastSessionLog(
       contentReplacements.get(sessionId) ?? [],
     ),
     worktreeSession: worktreeStates.get(sessionId),
+    goal: goalStates.get(sessionId),
+    sessionBranch: sessionBranches.get(sessionId),
     contextCollapseCommits: contextCollapseCommits.filter(
       e => e.sessionId === sessionId,
     ),
@@ -4738,7 +4880,7 @@ export async function findUnresolvedToolUse(
     const transcriptPath = getTranscriptPath()
     const { messages } = await loadTranscriptFile(transcriptPath)
 
-    let toolUseMessage = null
+    let toolUseMessage: TranscriptMessage | null = null
 
     // Find the tool use but make sure there's not also a result
     for (const message of messages.values()) {
@@ -4870,6 +5012,8 @@ export async function loadAllLogsFromSessionFile(
     fileHistorySnapshots,
     attributionSnapshots,
     contentReplacements,
+    goalStates,
+    sessionBranches,
     leafUuids,
   } = await loadTranscriptFile(sessionFile, { keepAllLeaves: true })
 
@@ -4943,6 +5087,8 @@ export async function loadAllLogsFromSessionFile(
         chain,
       ),
       contentReplacements: contentReplacements.get(sessionId) ?? [],
+      goal: goalStates.get(sessionId),
+      sessionBranch: sessionBranches.get(sessionId),
     })
   }
 
@@ -5126,7 +5272,7 @@ function extractFirstPromptFromChunk(chunk: string): string {
         if (commandNameTag) {
           const name = commandNameTag.replace(/^\//, '')
           const commandArgs = extractTag(result, 'command-args')?.trim() || ''
-          if (builtInCommandNames().has(name) || !commandArgs) {
+          if (getBuiltInCommandNames().has(name) || !commandArgs) {
             if (!firstCommandFallback) {
               firstCommandFallback = commandNameTag
             }

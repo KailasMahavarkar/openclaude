@@ -14,6 +14,7 @@ import type {
 } from '../services/oauth/types.js'
 import { getCwd } from '../utils/cwd.js'
 import { registerCleanup } from './cleanupRegistry.js'
+import { createDeferredWriter } from './deferredConfigWrites.js'
 import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
 import { getGlobalClaudeFile } from './env.js'
@@ -31,6 +32,7 @@ import { normalizePathForConfigKey } from './path.js'
 import { getEssentialTrafficOnlyReason } from './privacyLevel.js'
 import { getManagedFilePath } from './settings/managedPath.js'
 import type { ThemeSetting } from './theme.js'
+import { PRIMARY_PROJECT_INSTRUCTION_FILE } from './projectInstructions.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const teamMemPaths = feature('TEAMMEM')
@@ -113,7 +115,9 @@ export type ProjectConfig = {
   hasCompletedProjectOnboarding?: boolean
   projectOnboardingSeenCount: number
   hasClaudeMdExternalIncludesApproved?: boolean
+  hasClaudeMdExternalIncludesApprovedForUser?: boolean
   hasClaudeMdExternalIncludesWarningShown?: boolean
+  hasClaudeMdExternalIncludesWarningShownForUser?: boolean
   // MCP server approval fields - migrated to settings but kept for backward compatibility
   enabledMcpjsonServers?: string[]
   disabledMcpjsonServers?: string[]
@@ -144,7 +148,9 @@ const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   hasTrustDialogAccepted: false,
   projectOnboardingSeenCount: 0,
   hasClaudeMdExternalIncludesApproved: false,
+  hasClaudeMdExternalIncludesApprovedForUser: false,
   hasClaudeMdExternalIncludesWarningShown: false,
+  hasClaudeMdExternalIncludesWarningShownForUser: false,
 }
 
 export type InstallMethod = 'local' | 'native' | 'global' | 'unknown'
@@ -178,15 +184,52 @@ export type EditorMode = 'emacs' | (typeof EDITOR_MODES)[number]
 
 export type DiffTool = 'terminal' | 'auto'
 
+export type ShowCacheStatsMode = 'off' | 'compact' | 'full'
+export const SHOW_CACHE_STATS_MODES = ['off', 'compact', 'full'] as const satisfies readonly ShowCacheStatsMode[]
+
+export const MAX_MESSAGES_COMPACTION_THRESHOLDS = [
+  'off',
+  '100',
+  '200',
+  '500',
+  '1000',
+] as const
+export type MaxMessagesCompactionThreshold =
+  (typeof MAX_MESSAGES_COMPACTION_THRESHOLDS)[number]
+
+export function normalizeMaxMessagesCompactionThreshold(
+  value: unknown,
+): MaxMessagesCompactionThreshold {
+  return MAX_MESSAGES_COMPACTION_THRESHOLDS.includes(
+    value as MaxMessagesCompactionThreshold,
+  )
+    ? (value as MaxMessagesCompactionThreshold)
+    : 'off'
+}
+
 export type OutputStyle = string
+
+export type Providers = string
+export type OpenAICompatibleApiFormat = 'chat_completions' | 'responses' | 'responses_compat'
+export type OpenAICompatibleAuthScheme = 'bearer' | 'raw'
 
 export type ProviderProfile = {
   id: string
   name: string
-  provider: 'openai' | 'anthropic'
+  provider: Providers
   baseUrl: string
   model: string
   apiKey?: string
+  apiFormat?: OpenAICompatibleApiFormat
+  authHeader?: string
+  authScheme?: OpenAICompatibleAuthScheme
+  authHeaderValue?: string
+  customHeaders?: Record<string, string>
+  /**
+   * Optional manual override for the provider/model context window in tokens.
+   * Applied to OpenAI-compatible providers when resolving runtime limits.
+   */
+  maxContextLength?: number
 }
 
 export type GlobalConfig = {
@@ -241,7 +284,14 @@ export type GlobalConfig = {
   bypassPermissionsModeAccepted?: boolean
   hasUsedBackslashReturn?: boolean
   autoCompactEnabled: boolean // Controls whether auto-compact is enabled
+  contextCollapseEnabled: boolean // Opt-in: collapse old transcript spans into summaries (lossy; off by default)
+  toolHistoryCompressionEnabled: boolean // Compress old tool_result content for small-context providers
   showTurnDuration: boolean // Controls whether to show turn duration message (e.g., "Cooked for 1m 6s")
+  // Controls whether to show per-query cache hit/miss stats at the end of each turn.
+  // 'off'     — no display
+  // 'compact' — one-line summary (e.g. "[Cache: 1.2k read • hit 12%]")
+  // 'full'    — breakdown (read / created / hit-rate) per query
+  showCacheStats: ShowCacheStatsMode
   /**
    * @deprecated Use settings.env instead.
    */
@@ -273,6 +323,13 @@ export type GlobalConfig = {
 
   tipsHistory: {
     [tipId: string]: number // Key is tipId, value is the numStartups when tip was last shown
+  }
+
+  // Sponsored tip throttling. lastShownAt is numStartups when last sponsored tip
+  // was displayed; used with sponsoredTipsFrequency to enforce a 1-in-N cap.
+  sponsoredTipsHistory?: {
+    lastShownAt: number
+    totalShown: number
   }
 
   // /buddy companion soul — bones regenerated from userId on read. See src/buddy/.
@@ -364,6 +421,14 @@ export type GlobalConfig = {
   // Btw usage tracking
   btwUseCount: number // Number of times user has used /btw
 
+  // Sponsored tips (ads.gitlawb.com) — opt-in earning of opengateway credits.
+  // Managed via the /ads command, NOT /config — intentionally excluded from
+  // GLOBAL_CONFIG_KEYS (the earnCode is a credential, never surfaced in /config).
+  ads?: {
+    enabled: boolean
+    earnCode?: string // issued in the opengateway Earn tab, sent as x-earn-code
+  }
+
   // Plan mode usage tracking
   lastPlanModeUse?: number // Timestamp of last plan mode usage
 
@@ -410,7 +475,7 @@ export type GlobalConfig = {
   modelSwitchCalloutLastShown?: number // Timestamp of last shown (don't show for 24h)
   modelSwitchCalloutVersion?: string
 
-  // Effort callout tracking - shown once for Opus 4.6 users
+  // Effort callout tracking - shown once for recent Opus users (4.8/4.7/4.6)
   effortCalloutDismissed?: boolean // v1 - legacy, read to suppress v2 for Pro users who already saw it
   effortCalloutV2Dismissed?: boolean
 
@@ -545,6 +610,9 @@ export type GlobalConfig = {
   // PR status footer configuration (feature-flagged via GrowthBook)
   prStatusFooterEnabled?: boolean // Show PR review status in footer (default: true)
 
+  // Built-in status bar shown when no custom statusLine command is configured (default: true)
+  defaultStatusLineEnabled?: boolean
+
   // Tmux live panel visibility (internal-only, toggled via Enter on tmux pill)
   tungstenPanelVisible?: boolean
 
@@ -602,6 +670,25 @@ export type GlobalConfig = {
   // CURRENT_MIGRATION_VERSION, runMigrations() skips all sync migrations
   // (avoiding 11× saveGlobalConfig lock+re-read on every startup).
   migrationVersion?: number
+
+  // Knowledge Graph configuration
+  knowledgeGraphEnabled: boolean
+
+  // Startup splash logo color scheme — set via /logo. See
+  // src/components/StartupScreen.palettes.ts for valid values. Stored as a
+  // plain string (validated on read) to avoid pulling a UI module into the
+  // config layer. Falls back to 'sunset' if missing or unrecognized.
+  logoColor?: string
+
+  // Message-count-based compaction threshold. Set via /config.
+  // 'off' = disabled (default). Otherwise, one of '100', '200', '500', '1000'.
+  // When enabled, triggers forced compaction if the message count exceeds the
+  // chosen threshold, regardless of token usage.
+  maxMessagesCompactionThreshold?: MaxMessagesCompactionThreshold
+
+  // Use a different (e.g. cheaper/faster) model for compaction.
+  // Defaults to mainLoopModel when unset.
+  compactModel?: string
 }
 
 /**
@@ -610,7 +697,7 @@ export type GlobalConfig = {
  * a factory gives fresh refs at zero clone cost.
  */
 function createDefaultGlobalConfig(): GlobalConfig {
-  return {
+  const config: GlobalConfig = {
     numStartups: 0,
     installMethod: undefined,
     autoUpdates: undefined,
@@ -619,7 +706,10 @@ function createDefaultGlobalConfig(): GlobalConfig {
     verbose: false,
     editorMode: 'normal',
     autoCompactEnabled: true,
+    contextCollapseEnabled: false,
+    toolHistoryCompressionEnabled: true,
     showTurnDuration: true,
+    showCacheStats: 'compact',
     hasSeenTasksHint: false,
     hasUsedStash: false,
     hasUsedBackgroundTask: false,
@@ -641,6 +731,7 @@ function createDefaultGlobalConfig(): GlobalConfig {
     autoInstallIdeExtension: true,
     fileCheckpointingEnabled: true,
     terminalProgressBarEnabled: true,
+    defaultStatusLineEnabled: true,
     cachedStatsigGates: {},
     cachedDynamicConfigs: {},
     cachedGrowthBookFeatures: {},
@@ -648,7 +739,12 @@ function createDefaultGlobalConfig(): GlobalConfig {
     copyFullResponse: false,
     providerProfiles: [],
     openaiAdditionalModelOptionsCacheByProfile: {},
+    knowledgeGraphEnabled: true,
+    // Omitted by default so callers can distinguish "unset" from an explicit
+    // persisted "off"; normalizeMaxMessagesCompactionThreshold keeps the
+    // effective default disabled.
   }
+  return config
 }
 
 export const DEFAULT_GLOBAL_CONFIG: GlobalConfig = createDefaultGlobalConfig()
@@ -665,10 +761,14 @@ export const GLOBAL_CONFIG_KEYS = [
   'editorMode',
   'hasUsedBackslashReturn',
   'autoCompactEnabled',
+  'contextCollapseEnabled',
+  'toolHistoryCompressionEnabled',
   'showTurnDuration',
+  'showCacheStats',
   'diffTool',
   'env',
   'tipsHistory',
+  'sponsoredTipsHistory',
   'todoFeatureEnabled',
   'showExpandedTodos',
   'messageIdleNotifThresholdMs',
@@ -691,8 +791,13 @@ export const GLOBAL_CONFIG_KEYS = [
   'flickerFreeMode',
   'permissionExplainerEnabled',
   'prStatusFooterEnabled',
+  'defaultStatusLineEnabled',
   'remoteControlAtStartup',
   'remoteDialogSeen',
+  'knowledgeGraphEnabled',
+  'logoColor',
+  'maxMessagesCompactionThreshold',
+  'compactModel',
 ] as const
 
 export type GlobalConfigKey = (typeof GLOBAL_CONFIG_KEYS)[number]
@@ -791,12 +896,29 @@ export function isPathTrusted(dir: string): boolean {
 }
 
 // We have to put this test code here because Jest doesn't support mocking ES modules :O
-const TEST_GLOBAL_CONFIG_FOR_TESTING: GlobalConfig = {
-  ...DEFAULT_GLOBAL_CONFIG,
-  autoUpdates: false,
+// Use function accessors backed by `var` so cyclic test-only module graphs
+// never trip TDZ while config.ts is still evaluating.
+var testGlobalConfigForTesting: GlobalConfig | undefined
+var testProjectConfigForTesting: ProjectConfig | undefined
+
+function getTestGlobalConfigForTesting(): GlobalConfig {
+  if (!testGlobalConfigForTesting) {
+    testGlobalConfigForTesting = {
+      ...DEFAULT_GLOBAL_CONFIG,
+      autoUpdates: false,
+      knowledgeGraphEnabled: true,
+    }
+  }
+  return testGlobalConfigForTesting
 }
-const TEST_PROJECT_CONFIG_FOR_TESTING: ProjectConfig = {
-  ...DEFAULT_PROJECT_CONFIG,
+
+function getTestProjectConfigForTesting(): ProjectConfig {
+  if (!testProjectConfigForTesting) {
+    testProjectConfigForTesting = {
+      ...DEFAULT_PROJECT_CONFIG,
+    }
+  }
+  return testProjectConfigForTesting
 }
 
 export function isProjectConfigKey(key: string): key is ProjectConfigKey {
@@ -828,14 +950,24 @@ export function saveGlobalConfig(
   updater: (currentConfig: GlobalConfig) => GlobalConfig,
 ): void {
   if (process.env.NODE_ENV === 'test') {
-    const config = updater(TEST_GLOBAL_CONFIG_FOR_TESTING)
+    const current = getTestGlobalConfigForTesting()
+    const config = updater(current)
     // Skip if no changes (same reference returned)
-    if (config === TEST_GLOBAL_CONFIG_FOR_TESTING) {
+    if (config === current) {
       return
     }
-    Object.assign(TEST_GLOBAL_CONFIG_FOR_TESTING, config)
+    Object.assign(current, config)
     return
   }
+
+  // Apply any queued deferred writes first. A direct save re-reads the on-disk
+  // config and write-throughs that snapshot into globalConfigCache; without
+  // draining the deferred queue first, that snapshot would drop the pending
+  // counter deltas the cache is holding and same-process readers would observe
+  // stale values until the debounce fires. flushGlobalConfigWrites() is a no-op
+  // when nothing is queued, and the drain empties the queue before its own
+  // saveGlobalConfig runs, so this recurses at most one level.
+  flushGlobalConfigWrites()
 
   let written: GlobalConfig | null = null
   try {
@@ -903,6 +1035,78 @@ export function saveGlobalConfig(
   }
 }
 
+// Coalesced (debounced) global-config writer.
+//
+// saveGlobalConfig does a synchronous lockfile acquire + full re-read + backup
+// copy + fsync on every call, which stalls the event loop (and drops frames)
+// when several low-stakes writes land back-to-back. saveGlobalConfigDeferred
+// queues the updater, write-throughs the in-memory cache immediately so
+// same-process reads stay coherent, and folds all pending updaters into a
+// single locked saveGlobalConfig on a trailing debounce. The auth-loss guard,
+// lockfile and backup all remain on saveGlobalConfig's disk path — this only
+// batches WHEN the disk write happens, never how. Do NOT route auth, onboarding
+// or migration writes through it (see GH #3117); it is for idempotent,
+// loss-tolerant counters/flags only.
+const CONFIG_FLUSH_DEBOUNCE_MS = 500
+
+// The queue/debounce/write-through/batch-drain logic lives in a generic,
+// disk-free engine (see deferredConfigWrites.ts) so it can be unit-tested with
+// injected storage/scheduler. Here we wire the real saveGlobalConfig, in-memory
+// cache, and timers into it.
+const globalConfigDeferredWriter = createDeferredWriter<
+  GlobalConfig,
+  ReturnType<typeof setTimeout>
+>({
+  debounceMs: CONFIG_FLUSH_DEBOUNCE_MS,
+  save: updater => saveGlobalConfig(updater),
+  readCache: () => globalConfigCache.config,
+  writeThrough: next => writeThroughGlobalConfigCache(next),
+  setTimer: (fn, ms) => {
+    const timer = setTimeout(fn, ms)
+    // A pending config flush must never hold the process open on its own.
+    timer.unref?.()
+    return timer
+  },
+  clearTimer: timer => clearTimeout(timer),
+})
+
+export function saveGlobalConfigDeferred(
+  updater: (currentConfig: GlobalConfig) => GlobalConfig,
+): void {
+  // Keep tests synchronous and observable, matching saveGlobalConfig.
+  if (process.env.NODE_ENV === 'test') {
+    saveGlobalConfig(updater)
+    return
+  }
+  // Prime the cache before enqueueing. The deferred writer only write-throughs
+  // the pending updater when there is a cached config to apply it to; on a cold
+  // cache (no prior read) it would skip the write-through and the first deferred
+  // counter update would be invisible to getGlobalConfig() until the debounce
+  // flush — breaking same-process read coherence.
+  if (globalConfigCache.config === null) {
+    getGlobalConfig()
+  }
+  globalConfigDeferredWriter.defer(updater)
+}
+
+// Force any queued deferred writes to disk now. Safe to call repeatedly; a
+// no-op when nothing is pending. Call before reading the config from disk in
+// another process, or before spawning a subprocess that reads it.
+export function flushGlobalConfigWrites(): void {
+  globalConfigDeferredWriter.flush()
+}
+
+// Flush queued writes on shutdown. registerCleanup covers graceful exits; the
+// sync 'exit' handler is the hard-exit backstop (flush is fully synchronous).
+// eslint-disable-next-line custom-rules/no-top-level-side-effects
+registerCleanup(async () => {
+  flushGlobalConfigWrites()
+})
+// eslint-disable-next-line custom-rules/no-top-level-side-effects
+process.on('exit', () => {
+  flushGlobalConfigWrites()
+})
+
 // Cache for global config
 let globalConfigCache: { config: GlobalConfig | null; mtime: number } = {
   config: null,
@@ -915,7 +1119,7 @@ let configCacheHits = 0
 let configCacheMisses = 0
 // Session-total count of actual disk writes to the global config file.
 // Exposed for internal-only dev diagnostics (see inc-4552) so anomalous write
-// rates surface in the UI before they corrupt ~/.claude.json.
+// rates surface in the UI before they corrupt ~/.openclaude.json.
 let globalConfigWriteCount = 0
 
 export function getGlobalConfigWriteCount(): number {
@@ -948,13 +1152,26 @@ registerCleanup(async () => {
  * @internal
  */
 function migrateConfigFields(config: GlobalConfig): GlobalConfig {
+  const { maxMessagesCompactionThreshold, ...restConfig } = config
+  const normalizedConfig = {
+    ...restConfig,
+    ...(maxMessagesCompactionThreshold === undefined
+      ? {}
+      : {
+          maxMessagesCompactionThreshold:
+            normalizeMaxMessagesCompactionThreshold(
+              maxMessagesCompactionThreshold,
+            ),
+        }),
+  }
+
   // Already migrated
-  if (config.installMethod !== undefined) {
-    return config
+  if (normalizedConfig.installMethod !== undefined) {
+    return normalizedConfig
   }
 
   // autoUpdaterStatus is removed from the type but may exist in old configs
-  const legacy = config as GlobalConfig & {
+  const legacy = normalizedConfig as GlobalConfig & {
     autoUpdaterStatus?:
       | 'migrated'
       | 'installed'
@@ -966,7 +1183,7 @@ function migrateConfigFields(config: GlobalConfig): GlobalConfig {
 
   // Determine install method and auto-update preference from old field
   let installMethod: InstallMethod = 'unknown'
-  let autoUpdates = config.autoUpdates ?? true // Default to enabled unless explicitly disabled
+  let autoUpdates = normalizedConfig.autoUpdates ?? true // Default to enabled unless explicitly disabled
 
   switch (legacy.autoUpdaterStatus) {
     case 'migrated':
@@ -991,7 +1208,7 @@ function migrateConfigFields(config: GlobalConfig): GlobalConfig {
   }
 
   return {
-    ...config,
+    ...normalizedConfig,
     installMethod,
     autoUpdates,
   }
@@ -1081,7 +1298,7 @@ function writeThroughGlobalConfigCache(config: GlobalConfig): void {
 
 export function getGlobalConfig(): GlobalConfig {
   if (process.env.NODE_ENV === 'test') {
-    return TEST_GLOBAL_CONFIG_FOR_TESTING
+    return getTestGlobalConfigForTesting()
   }
 
   // Fast path: pure memory read. After startup, this always hits — our own
@@ -1254,7 +1471,7 @@ function saveConfigWithLock<A extends object>(
     const currentConfig = getConfig(file, createDefault)
     if (file === getGlobalClaudeFile() && wouldLoseAuthState(currentConfig)) {
       logForDebugging(
-        'saveConfigWithLock: re-read config is missing auth that cache has; refusing to write to avoid wiping ~/.claude.json. See GH #3117.',
+        'saveConfigWithLock: re-read config is missing auth that cache has; refusing to write to avoid wiping ~/.openclaude.json. See GH #3117.',
         { level: 'error' },
       )
       logEvent('tengu_config_auth_loss_prevented', {})
@@ -1639,7 +1856,7 @@ export const getProjectPathForConfig = memoize((): string => {
 
 export function getCurrentProjectConfig(): ProjectConfig {
   if (process.env.NODE_ENV === 'test') {
-    return TEST_PROJECT_CONFIG_FOR_TESTING
+    return getTestProjectConfigForTesting()
   }
 
   const absolutePath = getProjectPathForConfig()
@@ -1664,12 +1881,13 @@ export function saveCurrentProjectConfig(
   updater: (currentConfig: ProjectConfig) => ProjectConfig,
 ): void {
   if (process.env.NODE_ENV === 'test') {
-    const config = updater(TEST_PROJECT_CONFIG_FOR_TESTING)
+    const current = getTestProjectConfigForTesting()
+    const config = updater(current)
     // Skip if no changes (same reference returned)
-    if (config === TEST_PROJECT_CONFIG_FOR_TESTING) {
+    if (config === current) {
       return
     }
-    Object.assign(TEST_PROJECT_CONFIG_FOR_TESTING, config)
+    Object.assign(current, config)
     return
   }
   const absolutePath = getProjectPathForConfig()
@@ -1823,7 +2041,7 @@ export function getMemoryPath(memoryType: MemoryType): string {
     case 'Local':
       return join(cwd, 'CLAUDE.local.md')
     case 'Project':
-      return join(cwd, 'CLAUDE.md')
+      return join(cwd, PRIMARY_PROJECT_INSTRUCTION_FILE)
     case 'Managed':
       return join(getManagedFilePath(), 'CLAUDE.md')
     case 'AutoMem':

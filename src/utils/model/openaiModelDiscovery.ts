@@ -1,5 +1,7 @@
 import axios from 'axios'
+import { firstUsableCredential } from '../../services/api/credentialPool.js'
 import { logForDebugging } from '../debug.js'
+import { isEssentialTrafficOnly } from '../privacyLevel.js'
 import type { ModelOption } from './modelOptions.js'
 import { getAPIProvider } from './providers.js'
 
@@ -39,10 +41,24 @@ function isAzureOpenAIBaseUrl(baseUrl: string): boolean {
   }
 }
 
+function isBankrBaseUrl(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase().includes('bankr')
+  } catch {
+    return false
+  }
+}
+
 function getOpenAIAuthHeaders(baseUrl: string): Record<string, string> {
-  const apiKey = process.env.OPENAI_API_KEY?.trim()
+  const apiKey =
+    firstUsableCredential(process.env.OPENAI_API_KEYS) ??
+    firstUsableCredential(process.env.OPENAI_API_KEY)
   if (!apiKey) {
     return {}
+  }
+
+  if (isBankrBaseUrl(baseUrl)) {
+    return { 'X-API-Key': apiKey }
   }
 
   const headers: Record<string, string> = {
@@ -162,6 +178,11 @@ async function fetchOllamaModels(
 export async function discoverOpenAICompatibleModelOptions(): Promise<
   ModelOption[]
 > {
+  if (isEssentialTrafficOnly()) {
+    logForDebugging('[ModelDiscovery] Skipped: Nonessential traffic disabled')
+    return []
+  }
+
   if (getAPIProvider() !== 'openai') {
     return []
   }

@@ -20,7 +20,7 @@ import { errorMessage } from '../../utils/errors.js';
 import { logMCPDebug } from '../../utils/log.js';
 import { capitalize } from '../../utils/stringUtils.js';
 import { ConfigurableShortcutHint } from '../ConfigurableShortcutHint.js';
-import { Select } from '../CustomSelect/index.js';
+import { Select, type OptionWithDescription } from '../CustomSelect/index.js';
 import { Byline } from '../design-system/Byline.js';
 import { KeyboardShortcutHint } from '../design-system/KeyboardShortcutHint.js';
 import { Spinner } from '../Spinner.js';
@@ -102,9 +102,9 @@ export function MCPRemoteServerMenu({
       if (success) {
         onComplete?.(`Authentication successful. Connected to ${server.name}.`);
       } else if (result.client.type === 'needs-auth') {
-        onComplete?.('Authentication successful, but server still requires authentication. You may need to manually restart Claude Code.');
+        onComplete?.('Authentication successful, but server still requires authentication. You may need to manually restart OpenClaude.');
       } else {
-        onComplete?.('Authentication successful, but server reconnection failed. You may need to manually restart Claude Code for the changes to take effect.');
+        onComplete?.('Authentication successful, but server reconnection failed. You may need to manually restart OpenClaude for the changes to take effect.');
       }
     } catch (err) {
       logEvent('tengu_claudeai_mcp_auth_completed', {
@@ -281,11 +281,11 @@ export function MCPRemoteServerMenu({
           const message = isEffectivelyAuthenticated ? `Authentication successful. Reconnected to ${server.name}.` : `Authentication successful. Connected to ${server.name}.`;
           onComplete?.(message);
         } else if (result_0.client.type === 'needs-auth') {
-          onComplete?.('Authentication successful, but server still requires authentication. You may need to manually restart Claude Code.');
+          onComplete?.('Authentication successful, but server still requires authentication. You may need to manually restart OpenClaude.');
         } else {
           // result.client.type === 'failed'
           logMCPDebug(server.name, `Reconnection failed after authentication`);
-          onComplete?.('Authentication successful, but server reconnection failed. You may need to manually restart Claude Code for the changes to take effect.');
+          onComplete?.('Authentication successful, but server reconnection failed. You may need to manually restart OpenClaude for the changes to take effect.');
         }
       }
     } catch (err_1) {
@@ -467,7 +467,7 @@ export function MCPRemoteServerMenu({
         <Text dimColor>This may take a few moments.</Text>
       </Box>;
   }
-  const menuOptions = [];
+  const menuOptions: OptionWithDescription<string>[] = [];
 
   // If server is disabled, show Enable first as the primary action
   if (server.client.type === 'disabled') {

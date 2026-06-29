@@ -283,7 +283,7 @@ function createSpeculationFeedbackMessage(
   const toolUses = countToolsInMessages(messages)
   const tokens = boundary?.type === 'complete' ? boundary.outputTokens : null
 
-  const parts = []
+  const parts: string[] = []
   if (toolUses > 0) {
     parts.push(`Speculated ${toolUses} tool ${toolUses === 1 ? 'use' : 'uses'}`)
   } else {
@@ -471,6 +471,7 @@ export async function startSpeculation(
           const canAutoAcceptEdits =
             mode === 'acceptEdits' ||
             mode === 'bypassPermissions' ||
+            mode === 'fullAccess' ||
             (mode === 'plan' && isBypassPermissionsModeAvailable)
 
           if (!canAutoAcceptEdits) {

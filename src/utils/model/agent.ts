@@ -1,19 +1,22 @@
+import type { SettingsJson } from '../settings/types.js'
+import { getInitialSettings } from '../settings/settings.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { capitalize } from '../stringUtils.js'
-import { MODEL_ALIASES, type ModelAlias } from './aliases.js'
+import { MODEL_ALIASES } from './aliases.js'
 import { applyBedrockRegionPrefix, getBedrockRegionPrefix } from './bedrock.js'
+import { isModelAllowed } from './modelAllowlist.js'
 import {
   getCanonicalName,
   getRuntimeMainLoopModel,
   parseUserSpecifiedModel,
 } from './model.js'
-import { getAPIProvider } from './providers.js'
+import { getAPIProvider, isFirstPartyAnthropicBaseUrl } from './providers.js'
 
 export const AGENT_MODEL_OPTIONS = [...MODEL_ALIASES, 'inherit'] as const
 export type AgentModelAlias = (typeof AGENT_MODEL_OPTIONS)[number]
 
 export type AgentModelOption = {
-  value: AgentModelAlias
+  value: AgentModelAlias | (string & {})
   label: string
   description: string
 }
@@ -37,7 +40,7 @@ export function getDefaultSubagentModel(): string {
 export function getAgentModel(
   agentModel: string | undefined,
   parentModel: string,
-  toolSpecifiedModel?: ModelAlias,
+  toolSpecifiedModel?: string,
   permissionMode?: PermissionMode,
 ): string {
   if (process.env.CLAUDE_CODE_SUBAGENT_MODEL) {
@@ -67,15 +70,49 @@ export function getAgentModel(
   }
 
   // Prioritize tool-specified model if provided
-  if (toolSpecifiedModel) {
-    if (aliasMatchesParentTier(toolSpecifiedModel, parentModel)) {
+  const trimmedToolSpecifiedModel = toolSpecifiedModel?.trim()
+  if (trimmedToolSpecifiedModel) {
+    if (trimmedToolSpecifiedModel.toLowerCase() === 'inherit') {
+      return getRuntimeMainLoopModel({
+        permissionMode: permissionMode ?? 'default',
+        mainLoopModel: parentModel,
+        exceeds200kTokens: false,
+      })
+    }
+    if (aliasMatchesParentTier(trimmedToolSpecifiedModel, parentModel)) {
+      assertToolSpecifiedModelAllowed(trimmedToolSpecifiedModel, parentModel)
       return parentModel
     }
-    const model = parseUserSpecifiedModel(toolSpecifiedModel)
-    return applyParentRegionPrefix(model, toolSpecifiedModel)
+    const model = parseUserSpecifiedModel(trimmedToolSpecifiedModel)
+    const effectiveModel = applyParentRegionPrefix(
+      model,
+      trimmedToolSpecifiedModel,
+    )
+    assertToolSpecifiedModelAllowed(trimmedToolSpecifiedModel, effectiveModel)
+    return effectiveModel
   }
 
   const agentModelWithExp = agentModel ?? getDefaultSubagentModel()
+
+  // Provider-aware model alias fallback for agents.
+  // Claude-native providers (Bedrock, Vertex, Foundry, official Anthropic API)
+  // have guaranteed haiku/sonnet model availability. Custom Anthropic-compatible
+  // endpoints, OpenAI-shim, Gemini, Mistral, and other providers may not have
+  // equivalent models, causing "model not found" errors when resolving aliases.
+  // For haiku/sonnet aliases on non-Claude-native providers, inherit parent model.
+  // Note: 'opus' is NOT included here because it's handled separately by
+  // aliasMatchesParentTier() which checks if parent's tier matches the alias.
+  if (
+    (agentModelWithExp === 'haiku' || agentModelWithExp === 'sonnet') &&
+    !checkIsClaudeNativeProvider()
+  ) {
+    // Non-Claude-native provider → inherit parent model
+    return getRuntimeMainLoopModel({
+      permissionMode: permissionMode ?? 'default',
+      mainLoopModel: parentModel,
+      exceeds200kTokens: false,
+    })
+  }
 
   if (agentModelWithExp === 'inherit') {
     // Apply runtime model resolution for inherit to get the effective model
@@ -121,6 +158,37 @@ function aliasMatchesParentTier(alias: string, parentModel: string): boolean {
   }
 }
 
+function assertToolSpecifiedModelAllowed(
+  requestedModel: string,
+  effectiveModel: string,
+): void {
+  if (
+    isModelAllowed(requestedModel) ||
+    (effectiveModel !== requestedModel && isModelAllowed(effectiveModel))
+  ) {
+    return
+  }
+  throw new Error(
+    `Model '${requestedModel}' is not available. Your organization restricts model selection.`,
+  )
+}
+
+/**
+ * Check if the current provider is Claude-native (has guaranteed haiku/sonnet models).
+ * Claude-native providers: Bedrock, Vertex, Foundry, official Anthropic API.
+ * Non-Claude-native: OpenAI, Gemini, Mistral, GitHub, NVIDIA NIM, MiniMax,
+ * and custom Anthropic-compatible endpoints (proxies, self-hosted).
+ */
+export function checkIsClaudeNativeProvider(): boolean {
+  const provider = getAPIProvider()
+  return (
+    provider === 'bedrock' ||
+    provider === 'vertex' ||
+    provider === 'foundry' ||
+    (provider === 'firstParty' && isFirstPartyAnthropicBaseUrl())
+  )
+}
+
 export function getAgentModelDisplay(model: string | undefined): string {
   // When model is omitted, getDefaultSubagentModel() returns 'inherit' at runtime
   if (!model) return 'Inherit from parent (default)'
@@ -128,11 +196,10 @@ export function getAgentModelDisplay(model: string | undefined): string {
   return capitalize(model)
 }
 
-/**
- * Get available model options for agents
- */
-export function getAgentModelOptions(): AgentModelOption[] {
-  return [
+export function getAgentModelOptions(
+  settings: SettingsJson | null = getInitialSettings(),
+): AgentModelOption[] {
+  const baseOptions: AgentModelOption[] = [
     {
       value: 'sonnet',
       label: 'Sonnet',
@@ -154,4 +221,19 @@ export function getAgentModelOptions(): AgentModelOption[] {
       description: 'Use the same model as the main conversation',
     },
   ]
+
+  if (settings?.agentModels) {
+    const configuredKeys = Object.keys(settings.agentModels)
+    for (const key of configuredKeys) {
+      if (!baseOptions.some(opt => opt.value === key)) {
+        baseOptions.push({
+          value: key,
+          label: key,
+          description: 'Configured agent model',
+        })
+      }
+    }
+  }
+
+  return baseOptions
 }

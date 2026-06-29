@@ -2,7 +2,7 @@ import { c as _c } from "react-compiler-runtime";
 import { feature } from 'bun:bundle';
 import chalk from 'chalk';
 import { mkdir } from 'fs/promises';
-import { join } from 'path';
+import { basename, join } from 'path';
 import * as React from 'react';
 import { use, useEffect, useState } from 'react';
 import { getOriginalCwd } from '../../bootstrap/state.js';
@@ -24,6 +24,7 @@ import { projectIsInGitRepo } from '../../utils/memory/versions.js';
 import { updateSettingsForSource } from '../../utils/settings/settings.js';
 import { Select } from '../CustomSelect/index.js';
 import { ListItem } from '../design-system/ListItem.js';
+import { getProjectMemoryPathForSelector } from './memoryFileSelectorPaths.js';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const teamMemPaths = feature('TEAMMEM') ? require('../../memdir/teamMemPaths.js') as typeof import('../../memdir/teamMemPaths.js') : null;
@@ -47,9 +48,11 @@ export function MemoryFileSelector(t0) {
     onSelect,
     onCancel
   } = t0;
-  const existingMemoryFiles = use(getMemoryFiles());
+  const existingMemoryFiles = use(getMemoryFiles()) as MemoryFileInfo[];
+  const originalCwd = getOriginalCwd();
   const userMemoryPath = join(getClaudeConfigHomeDir(), "CLAUDE.md");
-  const projectMemoryPath = join(getOriginalCwd(), "CLAUDE.md");
+  const projectMemoryPath = getProjectMemoryPathForSelector(existingMemoryFiles, originalCwd);
+  const projectMemoryFileName = basename(projectMemoryPath);
   const hasUserMemory = existingMemoryFiles.some(f => f.path === userMemoryPath);
   const hasProjectMemory = existingMemoryFiles.some(f_0 => f_0.path === projectMemoryPath);
   const allMemoryFiles = [...existingMemoryFiles.filter(_temp).map(_temp2), ...(hasUserMemory ? [] : [{
@@ -85,12 +88,12 @@ export function MemoryFileSelector(t0) {
       }
     }
     let description;
-    const isGit = projectIsInGitRepo(getOriginalCwd());
+    const isGit = projectIsInGitRepo(originalCwd);
     if (file.type === "User" && !file.isNested) {
-      description = "Saved in ~/.claude/CLAUDE.md";
+      description = `Saved in ${getDisplayPath(userMemoryPath)}`;
     } else {
       if (file.type === "Project" && !file.isNested && file.path === projectMemoryPath) {
-        description = `${isGit ? "Checked in at" : "Saved in"} ./CLAUDE.md`;
+        description = `${isGit ? "Checked in at" : "Saved in"} ./${projectMemoryFileName}`;
       } else {
         if (file.parent) {
           description = "@-imported";
@@ -109,7 +112,7 @@ export function MemoryFileSelector(t0) {
       description
     };
   });
-  const folderOptions = [];
+  const folderOptions: Array<{ label: string; value: string; description: string }> = [];
   const agentDefinitions = useAppState(_temp3);
   if (isAutoMemoryEnabled()) {
     let t1;
@@ -124,7 +127,7 @@ export function MemoryFileSelector(t0) {
       t1 = $[0];
     }
     folderOptions.push(t1);
-    if (feature("TEAMMEM") && teamMemPaths.isTeamMemoryEnabled()) {
+    if (feature("TEAMMEM") && teamMemPaths != null && teamMemPaths.isTeamMemoryEnabled()) {
       let t2;
       if ($[1] === Symbol.for("react.memo_cache_sentinel")) {
         t2 = {
@@ -163,7 +166,7 @@ export function MemoryFileSelector(t0) {
   const [autoDreamOn, setAutoDreamOn] = useState(isAutoDreamEnabled);
   const [showDreamRow] = useState(isAutoMemoryEnabled);
   const isDreamRunning = useAppState(_temp6);
-  const [lastDreamAt, setLastDreamAt] = useState(null);
+  const [lastDreamAt, setLastDreamAt] = useState<number | null>(null);
   let t2;
   if ($[4] !== showDreamRow) {
     t2 = () => {
@@ -197,7 +200,7 @@ export function MemoryFileSelector(t0) {
     t4 = $[11];
   }
   const dreamStatus = t4;
-  const [focusedToggle, setFocusedToggle] = useState(null);
+  const [focusedToggle, setFocusedToggle] = useState<number | null>(null);
   const toggleFocused = focusedToggle !== null;
   const lastToggleIndex = showDreamRow ? 1 : 0;
   let t5;

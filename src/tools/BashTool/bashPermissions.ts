@@ -733,8 +733,14 @@ export function stripAllLeadingEnvVars(
   // dangerous forms like $(cmd), ${var}, and $((expr)). This means
   // FOO=$VAR is not stripped — adding $VAR matching creates ReDoS risk
   // (CodeQL #671) and $VAR bypasses are low-priority.
+  //
+  // SECURITY: Array subscript uses [^\]$`{(]* (not [^\]]*) to block command
+  // substitution in subscript position. Bash executes FOO[$(cmd)]=val as a
+  // side effect during assignment parsing; if the pattern matched $(cmd) in
+  // the subscript, the env-var prefix would be stripped while the substitution
+  // silently executed — bypassing deny rules that block the substituted command.
   const ENV_VAR_PATTERN =
-    /^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?)\+?=(?:'[^'\n\r]*'|"(?:\\.|[^"$`\\\n\r])*"|\\.|[^ \t\n\r$`;|&()<>\\\\'"])*[ \t]+/
+    /^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]$`{(]*\])?)\+?=(?:'[^'\n\r]*'|"(?:\\.|[^"$`\\\n\r])*"|\\.|[^ \t\n\r$`;|&()<>\\\\'"])*[ \t]+/
 
   let stripped = command
   let previousStripped = ''
@@ -1244,9 +1250,10 @@ export async function checkCommandAndSuggestRules(
  *   - allow if no explicit rules (sandbox auto-allow applies)
  *   - passthrough should not occur since we're in auto-allow mode
  */
-function checkSandboxAutoAllow(
+export function checkSandboxAutoAllow(
   input: z.infer<typeof BashTool.inputSchema>,
   toolPermissionContext: ToolPermissionContext,
+  astSubcommands: string[] | null = null,
 ): PermissionResult {
   const command = input.command.trim()
 
@@ -1278,6 +1285,32 @@ function checkSandboxAutoAllow(
   // would return 'ask' before a prefix deny rule on a subcommand (e.g., Bash(rm:*))
   // gets checked, downgrading a deny to an ask.
   const subcommands = splitCommand(command)
+
+  // CC-643: Mirror the legacy-only cap applied in `bashToolHasPermission` (see
+  // the `astSubcommands === null && subcommands.length > MAX...` branch). The
+  // fanout/ReDoS risk is specific to the legacy `splitCommand` path; when
+  // tree-sitter parsed the command cleanly (`astSubcommands !== null`), the
+  // subcommand count is already bounded by structural parse and a long
+  // AST-validated chain (e.g. many `echo`s) is intended to flow through.
+  if (
+    astSubcommands === null &&
+    subcommands.length > MAX_SUBCOMMANDS_FOR_SECURITY_CHECK
+  ) {
+    logForDebugging(
+      `bashPermissions(sandboxAutoAllow): ${subcommands.length} subcommands exceeds cap (${MAX_SUBCOMMANDS_FOR_SECURITY_CHECK}) — returning ask`,
+      { level: 'debug' },
+    )
+    const decisionReason = {
+      type: 'other' as const,
+      reason: `Command splits into ${subcommands.length} subcommands, too many to safety-check individually`,
+    }
+    return {
+      behavior: 'ask',
+      message: createPermissionRequestMessage(BashTool.name, decisionReason),
+      decisionReason,
+    }
+  }
+
   if (subcommands.length > 1) {
     let firstAskRule: PermissionRule | undefined
     for (const sub of subcommands) {
@@ -1443,7 +1476,11 @@ function buildPendingClassifierCheck(
   // Skip in auto mode - auto mode classifier handles all permission decisions
   if (feature('TRANSCRIPT_CLASSIFIER') && toolPermissionContext.mode === 'auto')
     return undefined
-  if (toolPermissionContext.mode === 'bypassPermissions') return undefined
+  if (
+    toolPermissionContext.mode === 'bypassPermissions' ||
+    toolPermissionContext.mode === 'fullAccess'
+  )
+    return undefined
 
   const allowDescriptions = getBashPromptAllowDescriptions(
     toolPermissionContext,
@@ -1457,7 +1494,22 @@ function buildPendingClassifierCheck(
   }
 }
 
+/** Maximum number of speculative classifier results to cache. */
+const MAX_SPECULATIVE_CHECKS_SIZE = 1000
 const speculativeChecks = new Map<string, Promise<ClassifierResult>>()
+
+/**
+ * Remove the oldest entries from speculativeChecks until the map is within
+ * the MAX_SPECULATIVE_CHECKS_SIZE cap. Eviction is FIFO based on insertion
+ * order (Map preserves insertion order for keys).
+ */
+function evictSpeculativeChecks(): void {
+  while (speculativeChecks.size > MAX_SPECULATIVE_CHECKS_SIZE) {
+    const oldestKey = speculativeChecks.keys().next().value
+    if (oldestKey === undefined) break
+    speculativeChecks.delete(oldestKey)
+  }
+}
 
 /**
  * Start a speculative bash allow classifier check early, so it runs in
@@ -1481,7 +1533,11 @@ export function startSpeculativeClassifierCheck(
   if (!isClassifierPermissionsEnabled()) return false
   if (feature('TRANSCRIPT_CLASSIFIER') && toolPermissionContext.mode === 'auto')
     return false
-  if (toolPermissionContext.mode === 'bypassPermissions') return false
+  if (
+    toolPermissionContext.mode === 'bypassPermissions' ||
+    toolPermissionContext.mode === 'fullAccess'
+  )
+    return false
   const allowDescriptions = getBashPromptAllowDescriptions(
     toolPermissionContext,
   )
@@ -1500,6 +1556,7 @@ export function startSpeculativeClassifierCheck(
   // The original promise (which may reject) is still stored in the Map for consumers to await.
   promise.catch(() => {})
   speculativeChecks.set(command, promise)
+  evictSpeculativeChecks()
   return true
 }
 
@@ -1519,6 +1576,13 @@ export function consumeSpeculativeClassifierCheck(
 
 export function clearSpeculativeChecks(): void {
   speculativeChecks.clear()
+}
+
+// Test-only surface for speculative cache eviction assertions.
+export const _test = {
+  speculativeChecks,
+  evictSpeculativeChecks,
+  MAX_SPECULATIVE_CHECKS_SIZE,
 }
 
 /**
@@ -1813,8 +1877,12 @@ export async function bashToolHasPermission(
     const sandboxAutoAllowResult = checkSandboxAutoAllow(
       input,
       appState.toolPermissionContext,
+      astSubcommands,
     )
-    if (sandboxAutoAllowResult.behavior !== 'passthrough') {
+    if (
+      sandboxAutoAllowResult.behavior === 'deny' ||
+      sandboxAutoAllowResult.behavior === 'ask'
+    ) {
       return sandboxAutoAllowResult
     }
   }

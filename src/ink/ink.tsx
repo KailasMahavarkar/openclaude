@@ -33,7 +33,7 @@ import createRenderer, { type Renderer } from './renderer.js';
 import { CellWidth, CharPool, cellAt, createScreen, HyperlinkPool, isEmptyCellAt, migrateScreenPools, StylePool } from './screen.js';
 import { applySearchHighlight } from './searchHighlight.js';
 import { applySelectionOverlay, captureScrolledRows, clearSelection, createSelectionState, extendSelection, type FocusMove, findPlainTextUrlAt, getSelectedText, hasSelection, moveFocus, type SelectionState, selectLineAt, selectWordAt, shiftAnchor, shiftSelection, shiftSelectionForFollow, startSelection, updateSelection } from './selection.js';
-import { SYNC_OUTPUT_SUPPORTED, supportsExtendedKeys, type Terminal, writeDiffToTerminal } from './terminal.js';
+import { shouldSkipMainScreenSyncMarkers, shouldUseMainScreenRewrite, SYNC_OUTPUT_SUPPORTED, supportsExtendedKeys, type Terminal, writeDiffToTerminal } from './terminal.js';
 import { CURSOR_HOME, cursorMove, cursorPosition, DISABLE_KITTY_KEYBOARD, DISABLE_MODIFY_OTHER_KEYS, ENABLE_KITTY_KEYBOARD, ENABLE_MODIFY_OTHER_KEYS, ERASE_SCREEN } from './termio/csi.js';
 import { DBP, DFE, DISABLE_MOUSE_TRACKING, ENABLE_MOUSE_TRACKING, ENTER_ALT_SCREEN, EXIT_ALT_SCREEN, SHOW_CURSOR } from './termio/dec.js';
 import { CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, setClipboard, supportsTabStatus, wrapForMultiplexer } from './termio/osc.js';
@@ -270,8 +270,6 @@ export default class Ink {
       }
     };
 
-    // @ts-expect-error @types/react-reconciler@0.32.3 declares 11 args with transitionCallbacks,
-    // but react-reconciler 0.33.0 source only accepts 10 args (no transitionCallbacks)
     this.container = reconciler.createContainer(
       this.rootNode,
       LegacyRoot,
@@ -293,7 +291,7 @@ export default class Ink {
         this.reportRenderError('recoverable', error);
       }, // onDefaultTransitionIndicator
     );
-    if ("production" === 'development') {
+    if (process.env.NODE_ENV === 'development') {
       reconciler.injectIntoDevTools({
         bundleType: 0,
         // Reporting React DOM's version, not Ink's
@@ -609,12 +607,13 @@ export default class Ink {
       };
     }
     const tDiff = performance.now();
+    const rewriteMainScreen = !this.altScreenActive && shouldUseMainScreenRewrite();
     const diff = this.log.render(prevFrame, frame, this.altScreenActive,
     // DECSTBM needs BSU/ESU atomicity — without it the outer terminal
     // renders the scrolled-but-not-yet-repainted intermediate state.
     // tmux is the main case (re-emits DECSTBM with its own timing and
     // doesn't implement DEC 2026, so SYNC_OUTPUT_SUPPORTED is false).
-    SYNC_OUTPUT_SUPPORTED);
+    SYNC_OUTPUT_SUPPORTED, rewriteMainScreen);
     const diffMs = performance.now() - tDiff;
     // Swap buffers
     this.backFrame = this.frontFrame;
@@ -759,7 +758,8 @@ export default class Ink {
       }
     }
     const tWrite = performance.now();
-    writeDiffToTerminal(this.terminal, optimized, this.altScreenActive && !SYNC_OUTPUT_SUPPORTED);
+    const skipSyncMarkers = this.altScreenActive ? !SYNC_OUTPUT_SUPPORTED : rewriteMainScreen || shouldSkipMainScreenSyncMarkers();
+    writeDiffToTerminal(this.terminal, optimized, skipSyncMarkers);
     const writeMs = performance.now() - tWrite;
 
     // Update blit safety for the NEXT frame. The frame just rendered
@@ -815,7 +815,6 @@ export default class Ink {
   }
   pause(): void {
     // Flush pending React updates and render before pausing.
-    // @ts-expect-error flushSyncFromReconciler exists in react-reconciler 0.31 but not in @types/react-reconciler
     reconciler.flushSyncFromReconciler();
     this.onRender();
     this.isPaused = true;
@@ -1115,7 +1114,9 @@ export default class Ink {
       offsetY: -elTop,
       prevScreen: undefined
     });
-    const rendered = output.get();
+    const rendered = output.get({
+      suppressHighWriteRatioDiagnostics: true
+    });
     // renderNodeToOutput wrote our offset positions to nodeCache —
     // corrupts the main render (it'd blit from wrong coords). Mark the
     // subtree dirty so the next main render repaints + re-caches
@@ -1474,9 +1475,7 @@ export default class Ink {
         </TerminalWriteProvider>
       </App>;
 
-    // @ts-expect-error updateContainerSync exists in react-reconciler but not in @types/react-reconciler
     reconciler.updateContainerSync(tree, this.container, null, noop);
-    // @ts-expect-error flushSyncWork exists in react-reconciler but not in @types/react-reconciler
     reconciler.flushSyncWork();
     logForDebugging('[Ink:render] updateContainer complete');
   }
@@ -1542,9 +1541,7 @@ export default class Ink {
       this.drainTimer = null;
     }
 
-    // @ts-expect-error updateContainerSync exists in react-reconciler but not in @types/react-reconciler
     reconciler.updateContainerSync(null, this.container, null, noop);
-    // @ts-expect-error flushSyncWork exists in react-reconciler but not in @types/react-reconciler
     reconciler.flushSyncWork();
     instances.delete(this.options.stdout);
 
@@ -1633,7 +1630,7 @@ export default class Ink {
     const stderr = process.stderr;
     const originalWrite = stderr.write;
     let reentered = false;
-    const intercept = (chunk: Uint8Array | string, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean => {
+    const intercept = (chunk: Uint8Array | string, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void): boolean => {
       const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
       // Reentrancy guard: logForDebugging → writeToStderr → here. Pass
       // through to the original so --debug-to-stderr still works and we

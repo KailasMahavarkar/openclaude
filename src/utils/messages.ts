@@ -36,6 +36,7 @@ import {
   getPdfPasswordProtectedErrorMessage,
   getPdfTooLargeErrorMessage,
   getRequestTooLargeErrorMessage,
+  getVisionNotSupportedErrorMessages,
 } from '../services/api/errors.js'
 import type { AnyObject, Progress } from '../Tool.js'
 import { isConnectorTextBlock } from '../types/connectorText.js'
@@ -75,6 +76,7 @@ import type {
 import { isAdvisorBlock } from './advisor.js'
 import { isAgentSwarmsEnabled } from './agentSwarmsEnabled.js'
 import { count } from './array.js'
+import { isEnvTruthy } from './envUtils.js'
 import {
   type Attachment,
   type HookAttachment,
@@ -155,6 +157,7 @@ import { validateImagesForAPI } from './imageValidation.js'
 import { safeParseJSON } from './json.js'
 import { logError, logMCPDebug } from './log.js'
 import { normalizeLegacyToolName } from './permissions/permissionRuleParser.js'
+import { isDangerousPermissionMode } from './permissions/PermissionMode.js'
 import {
   getPlanModeV2AgentCount,
   getPlanModeV2ExploreAgentCount,
@@ -195,7 +198,8 @@ export function withMemoryCorrectionHint(message: string): string {
 
 /**
  * Derive a short stable message ID (6-char base36 string) from a UUID.
- * Used for snip tool referencing — injected into API-bound messages as [id:...] tags.
+ * Used for snip tool referencing — injected into API-bound messages as internal
+ * system-reminder metadata.
  * Deterministic: same UUID always produces the same short ID.
  */
 export function deriveShortMessageId(uuid: string): string {
@@ -464,6 +468,7 @@ export function createUserMessage({
   isVisibleInTranscriptOnly,
   isVirtual,
   isCompactSummary,
+  isCollapseSummary,
   summarizeMetadata,
   toolUseResult,
   mcpMeta,
@@ -475,10 +480,11 @@ export function createUserMessage({
   origin,
 }: {
   content: string | ContentBlockParam[]
-  isMeta?: true
-  isVisibleInTranscriptOnly?: true
-  isVirtual?: true
-  isCompactSummary?: true
+  isMeta?: boolean
+  isVisibleInTranscriptOnly?: boolean
+  isVirtual?: boolean
+  isCompactSummary?: boolean
+  isCollapseSummary?: boolean
   toolUseResult?: unknown // Matches tool's `Output` type
   /** MCP protocol metadata to pass through to SDK consumers (never sent to model) */
   mcpMeta?: {
@@ -500,6 +506,11 @@ export function createUserMessage({
   // Provenance of this message. undefined = human (keyboard).
   origin?: MessageOrigin
 }): UserMessage {
+  const rewindRestorablePermissionMode = isDangerousPermissionMode(
+    permissionMode,
+  )
+    ? undefined
+    : permissionMode
   const m: UserMessage = {
     type: 'user',
     message: {
@@ -510,6 +521,7 @@ export function createUserMessage({
     isVisibleInTranscriptOnly,
     isVirtual,
     isCompactSummary,
+    isCollapseSummary,
     summarizeMetadata,
     uuid: (uuid as UUID | undefined) || randomUUID(),
     timestamp: timestamp ?? new Date().toISOString(),
@@ -517,7 +529,7 @@ export function createUserMessage({
     mcpMeta,
     imagePasteIds,
     sourceToolAssistantUUID,
-    permissionMode,
+    permissionMode: rewindRestorablePermissionMode,
     origin,
   }
   return m
@@ -809,6 +821,7 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
               toolUseResult: message.toolUseResult,
               mcpMeta: message.mcpMeta,
               isMeta: message.isMeta,
+              isCollapseSummary: message.isCollapseSummary,
               isVisibleInTranscriptOnly: message.isVisibleInTranscriptOnly,
               isVirtual: message.isVirtual,
               timestamp: message.timestamp,
@@ -821,6 +834,101 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
       }
     }
   })
+}
+
+// Per-element cache for normalizeMessages. The only cross-message state in
+// normalizeMessages is the monotonic isNewChain flag, so each message's
+// normalized output is fully determined by (message identity, entry flag).
+// Caching on the message object keeps output identity stable across calls,
+// which preserves downstream WeakMap caches and React.memo bailouts, and
+// reduces each unchanged message to an O(1) cache hit (reused blocks, no
+// re-splitting or re-allocation) instead of a full renormalization. The call
+// itself still scans the message list and reassembles the output array, so it
+// stays O(n) per render — this is an allocation/object-identity optimization,
+// not an O(1) append. Entries GC together with their messages.
+type NormalizedCacheEntry = {
+  entryFlag: boolean
+  exitFlag: boolean
+  out: NormalizedMessage[]
+}
+const normalizedMessageCache = new WeakMap<Message, NormalizedCacheEntry>()
+
+// Drop-in replacement for normalizeMessages on render hot paths. Reuses each
+// message's previously normalized blocks (preserving object identity) when the
+// incoming isNewChain flag matches the cached run; recomputes only changed or
+// new messages. Messages are treated as immutable, matching the assumptions of
+// the React.memo comparators downstream.
+export function normalizeMessagesCached(
+  messages: Message[],
+): NormalizedMessage[] {
+  const out: NormalizedMessage[] = []
+  let flag = false
+  for (const message of messages) {
+    const cached = normalizedMessageCache.get(message)
+    if (cached && cached.entryFlag === flag) {
+      for (const m of cached.out) {
+        out.push(m)
+      }
+      flag = cached.exitFlag
+      continue
+    }
+    const entryFlag = flag
+    // Reuse normalizeMessages for the actual block-splitting logic so the two
+    // implementations cannot drift. isNewChain only transitions false -> true,
+    // so seeding the single-element run with the current flag is equivalent to
+    // running the whole list: pass a synthetic multi-block predecessor when the
+    // flag is already set.
+    const normalized = normalizeSingleMessageWithFlag(message, entryFlag)
+    normalizedMessageCache.set(message, {
+      entryFlag,
+      exitFlag: normalized.exitFlag,
+      out: normalized.out,
+    })
+    for (const m of normalized.out) {
+      out.push(m)
+    }
+    flag = normalized.exitFlag
+  }
+  return out
+}
+
+function normalizeSingleMessageWithFlag(
+  message: Message,
+  entryFlag: boolean,
+): { out: NormalizedMessage[]; exitFlag: boolean } {
+  const exitFlag =
+    entryFlag ||
+    ((message.type === 'assistant' ||
+      (message.type === 'user' && typeof message.message.content !== 'string')) &&
+      message.message.content.length > 1)
+
+  if (!entryFlag) {
+    return { out: normalizeMessages([message]), exitFlag }
+  }
+
+  // normalizeMessages keys UUID derivation off its internal isNewChain flag;
+  // when the chain flag is already set for this position, every produced block
+  // must get a derived UUID. Recreate that by normalizing the single message
+  // and re-deriving UUIDs the same way the full pass would.
+  switch (message.type) {
+    case 'attachment':
+    case 'progress':
+    case 'system':
+      return { out: [message], exitFlag }
+    default: {
+      const normalized = normalizeMessages([message])
+      return {
+        out: normalized.map(
+          (m, index) =>
+            ({
+              ...m,
+              uuid: deriveUUID(message.uuid, index),
+            }) as NormalizedMessage,
+        ),
+        exitFlag,
+      }
+    }
+  }
 }
 
 type ToolUseRequestMessage = NormalizedAssistantMessage & {
@@ -854,19 +962,14 @@ export function isToolUseResultMessage(
 
 // Re-order, to move result messages to be after their tool use messages
 export function reorderMessagesInUI(
-  messages: (
-    | NormalizedUserMessage
-    | NormalizedAssistantMessage
-    | AttachmentMessage
-    | SystemMessage
-  )[],
+  messages: any[],  // eslint-disable-line @typescript-eslint/no-explicit-any
   syntheticStreamingToolUseMessages: NormalizedAssistantMessage[],
-): (
-  | NormalizedUserMessage
-  | NormalizedAssistantMessage
-  | AttachmentMessage
-  | SystemMessage
-)[] {
+): any[] {  // eslint-disable-line @typescript-eslint/no-explicit-any
+  // Boolean wrappers to avoid type-predicate narrowing (all message types are `any` stubs,
+  // so `Exclude<any, any>` = `never` after type guards)
+  const isToolUse = (m: any): boolean => isToolUseRequestMessage(m) // eslint-disable-line @typescript-eslint/no-explicit-any
+  const isHook = (m: any): boolean => isHookAttachmentMessage(m) // eslint-disable-line @typescript-eslint/no-explicit-any
+
   // Maps tool use ID to its related messages
   const toolUseGroups = new Map<
     string,
@@ -879,9 +982,10 @@ export function reorderMessagesInUI(
   >()
 
   // First pass: group messages by tool use ID
-  for (const message of messages) {
+  for (const _msg of messages) {
+    const message: any = _msg // eslint-disable-line @typescript-eslint/no-explicit-any
     // Handle tool use messages
-    if (isToolUseRequestMessage(message)) {
+    if (isToolUse(message)) {
       const toolUseID = message.message.content[0]?.id
       if (toolUseID) {
         if (!toolUseGroups.has(toolUseID)) {
@@ -899,7 +1003,7 @@ export function reorderMessagesInUI(
 
     // Handle pre-tool-use hooks
     if (
-      isHookAttachmentMessage(message) &&
+      isHook(message) &&
       message.attachment.hookEvent === 'PreToolUse'
     ) {
       const toolUseID = message.attachment.toolUseID
@@ -935,7 +1039,7 @@ export function reorderMessagesInUI(
 
     // Handle post-tool-use hooks
     if (
-      isHookAttachmentMessage(message) &&
+      isHook(message) &&
       message.attachment.hookEvent === 'PostToolUse'
     ) {
       const toolUseID = message.attachment.toolUseID
@@ -953,17 +1057,13 @@ export function reorderMessagesInUI(
   }
 
   // Second pass: reconstruct the message list in the correct order
-  const result: (
-    | NormalizedUserMessage
-    | NormalizedAssistantMessage
-    | AttachmentMessage
-    | SystemMessage
-  )[] = []
+  const result: any[] = [] // eslint-disable-line @typescript-eslint/no-explicit-any
   const processedToolUses = new Set<string>()
 
-  for (const message of messages) {
+  for (const _msg of messages) {
+    const message: any = _msg // eslint-disable-line @typescript-eslint/no-explicit-any
     // Check if this is a tool use
-    if (isToolUseRequestMessage(message)) {
+    if (isToolUse(message)) {
       const toolUseID = message.message.content[0]?.id
       if (toolUseID && !processedToolUses.has(toolUseID)) {
         processedToolUses.add(toolUseID)
@@ -983,7 +1083,7 @@ export function reorderMessagesInUI(
 
     // Check if this message is part of a tool use group
     if (
-      isHookAttachmentMessage(message) &&
+      isHook(message) &&
       (message.attachment.hookEvent === 'PreToolUse' ||
         message.attachment.hookEvent === 'PostToolUse')
     ) {
@@ -1534,6 +1634,19 @@ export function isSystemLocalCommandMessage(
 }
 
 /**
+ * A context-collapse summary placeholder. Like local-command system messages,
+ * its content must survive model-input normalization (converted to a user
+ * message) so the collapsed-span summary stays visible to the model.
+ */
+export function isCollapseSummaryMessage(message: Message): boolean {
+  return (
+    message.type === 'system' &&
+    message.subtype === 'informational' &&
+    (message as { isCollapseSummary?: boolean }).isCollapseSummary === true
+  )
+}
+
+/**
  * Strips tool_reference blocks for tools that no longer exist from tool_result content.
  * This handles the case where a session was saved with MCP tools that are no longer
  * available (e.g., MCP server was disconnected, renamed, or removed).
@@ -1614,18 +1727,46 @@ function stripUnavailableToolReferencesFromUserMessage(
 }
 
 /**
- * Appends a [id:...] message ID tag to the last text block of a user message.
+ * Appends internal snip metadata to the last text block of a user message.
  * Only mutates the API-bound copy, not the stored message.
  * This lets Claude reference message IDs when calling the snip tool.
  */
-function appendMessageTagToUserMessage(message: UserMessage): UserMessage {
-  if (message.isMeta) {
+export function appendMessageTagToUserMessage(
+  message: UserMessage,
+): UserMessage {
+  // isCollapseSummary blocks must never carry a snip id: the model could queue
+  // the only replacement for an archived span for removal. A merge can clear
+  // isMeta while keeping isCollapseSummary, so both are checked here.
+  if (message.isMeta || message.isCollapseSummary) {
     return message
   }
 
-  const tag = `\n[id:${deriveShortMessageId(message.uuid)}]`
+  const idToken = deriveShortMessageId(message.uuid)
+  const tag =
+    `\n<system-reminder>snip_id=${idToken}; system-generated; ` +
+    `for snip tool use only; do not discuss in thinking or responses.</system-reminder>`
 
   const content = message.message.content
+
+  // Idempotency: normalizeMessagesForAPI re-runs over messages that are carried
+  // forward as loop state (query.ts builds toolResults from this function's own
+  // normalized output, then re-normalizes that state next turn). Without this
+  // guard each pass stacks another internal marker on every prior tool result. The
+  // token is derived from this message's own uuid, so its presence inside the
+  // internal marker means we already tagged it (string body, last text block, or
+  // the dedicated tool_result text block). Leave it untouched.
+  const alreadyTagged =
+    typeof content === 'string'
+      ? content.includes(`snip_id=${idToken}`)
+      : Array.isArray(content) &&
+        content.some(
+          block =>
+            block!.type === 'text' &&
+            (block as TextBlockParam).text.includes(`snip_id=${idToken}`),
+        )
+  if (alreadyTagged) {
+    return message
+  }
 
   // Handle string content (most common for simple text input)
   if (typeof content === 'string') {
@@ -1651,7 +1792,24 @@ function appendMessageTagToUserMessage(message: UserMessage): UserMessage {
     }
   }
   if (lastTextIdx === -1) {
-    return message
+    // Pure tool_result messages (large Read/Bash outputs) carry no text block
+    // to host the metadata, yet they are the highest-value snip targets. Append
+    // a dedicated text block so the model can see the internal snip id without
+    // making it look user-authored. The tool_result block is left intact, so
+    // snip pairing is unaffected.
+    if (!content.some(block => block!.type === 'tool_result')) {
+      return message
+    }
+    return {
+      ...message,
+      message: {
+        ...message.message,
+        content: [
+          ...content,
+          { type: 'text' as const, text: tag.replace(/^\n/, '') },
+        ] as typeof content,
+      },
+    }
   }
 
   const newContent = [...content]
@@ -1668,6 +1826,42 @@ function appendMessageTagToUserMessage(message: UserMessage): UserMessage {
       content: newContent as typeof content,
     },
   }
+}
+
+// Matches the exact internal snip marker appended by appendMessageTagToUserMessage
+// (with or without the leading newline used for the no-text-block variant). The
+// body has no '<' chars, so [^<]* terminates cleanly at the closing tag.
+const SNIP_TAG_PATTERN =
+  /\n?<system-reminder>snip_id=[^<]*<\/system-reminder>/g
+
+/**
+ * Remove any internal snip marker from user content. Used when a merge folds a
+ * collapse summary into a real user turn: the real turn may have been tagged
+ * before the merge, and the merged block must not present a snip id (it carries
+ * the only replacement for an archived span).
+ */
+function stripSnipTagsFromContent(
+  content: string | ContentBlockParam[],
+): string | ContentBlockParam[] {
+  if (typeof content === 'string') {
+    return content.replace(SNIP_TAG_PATTERN, '')
+  }
+  if (!Array.isArray(content)) return content
+  const result: ContentBlockParam[] = []
+  for (const block of content) {
+    if (block?.type === 'text') {
+      const original = (block as TextBlockParam).text
+      const text = original.replace(SNIP_TAG_PATTERN, '')
+      // Drop a text block whose only content was the snip marker; sending an
+      // empty text block alongside the collapse summary is invalid. Pre-existing
+      // empty blocks are left untouched so this stays scoped to the merge path.
+      if (text === '' && original !== '') continue
+      result.push({ ...block, text })
+    } else {
+      result.push(block)
+    }
+  }
+  return result
 }
 
 /**
@@ -1766,7 +1960,13 @@ export function stripCallerFieldFromAssistantMessage(
           id: block.id,
           name: block.name,
           input: block.input,
-          ...(getAPIProvider() === 'gemini' && (block as any).extra_content ? { extra_content: (block as any).extra_content } : {})
+          // extra_content is a non-SDK extension field — cast type-side only
+          ...((block as { extra_content?: unknown }).extra_content
+            ? {
+                extra_content: (block as { extra_content?: unknown })
+                  .extra_content,
+              }
+            : {})
         }
       }),
     },
@@ -1995,6 +2195,18 @@ export function normalizeMessagesForAPI(
   // Build set of available tool names for filtering unavailable tool references
   const availableToolNames = new Set(tools.map(t => t.name))
 
+  // Whether to inject internal snip ids this pass. Gate must match
+  // SnipTool.isEnabled() and skip test mode — markers change message content
+  // hashes, breaking VCR fixture lookup. Computed once here so the pre-merge
+  // injection (in the user case) and the post-merge sweep below share it.
+  let injectSnipTags = false
+  if (feature('HISTORY_SNIP') && process.env.NODE_ENV !== 'test') {
+    const { isSnipRuntimeEnabled } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../services/compact/snipCompact.js') as typeof import('../services/compact/snipCompact.js')
+    injectSnipTags = isSnipRuntimeEnabled()
+  }
+
   // First, reorder attachments to bubble up until they hit a tool result or assistant message
   // Then strip virtual messages — they're display-only (e.g. REPL inner tool
   // calls) and must never reach the API.
@@ -2009,6 +2221,17 @@ export function normalizeMessagesForAPI(
     [getPdfInvalidErrorMessage()]: new Set(['document']),
     [getImageTooLargeErrorMessage()]: new Set(['image']),
     [getRequestTooLargeErrorMessage()]: new Set(['document', 'image']),
+    // Issue #1421: existing transcripts poisoned by a 400 "text is not set"
+    // (Xiaomi Mimo + non-vision model) carry an image-only tool_result that
+    // would re-trigger the same 400 on every retry. Match the canonical
+    // message so `normalizeMessagesForAPI` strips the `image` blocks from
+    // the preceding tool_result user message on resume / next turn.
+    ...Object.fromEntries(
+      getVisionNotSupportedErrorMessages().map(message => [
+        message,
+        new Set(['image']),
+      ]),
+    ),
   }
 
   // Walk the reordered messages to build a targeted strip map:
@@ -2064,10 +2287,13 @@ export function normalizeMessagesForAPI(
         | UserMessage
         | AssistantMessage
         | AttachmentMessage
-        | SystemLocalCommandMessage => {
+        | SystemLocalCommandMessage
+        | SystemInformationalMessage => {
         if (
           _.type === 'progress' ||
-          (_.type === 'system' && !isSystemLocalCommandMessage(_)) ||
+          (_.type === 'system' &&
+            !isSystemLocalCommandMessage(_) &&
+            !isCollapseSummaryMessage(_)) ||
           isSyntheticApiErrorMessage(_)
         ) {
           return false
@@ -2079,11 +2305,25 @@ export function normalizeMessagesForAPI(
       switch (message.type) {
         case 'system': {
           // local_command system messages need to be included as user messages
-          // so the model can reference previous command output in later turns
+          // so the model can reference previous command output in later turns.
+          // Context-collapse summaries take the same path so the <collapsed>
+          // summary stays visible after its archived span is removed.
+          //
+          // Preserve isMeta: collapse-summary placeholders are created isMeta so
+          // the snip-tag sweep (appendMessageTagToUserMessage skips isMeta) does
+          // not mark the only replacement for an archived span as snippable,
+          // which would let the model remove the summary collapse relies on.
+          // local_command messages carry no isMeta and stay snippable as before.
           const userMsg = createUserMessage({
             content: message.content,
             uuid: message.uuid,
             timestamp: message.timestamp,
+            isMeta: message.isMeta,
+            // Carry the collapse-summary marker onto the user message so it
+            // stays non-snippable even after a merge clears isMeta (a merge
+            // with an adjacent real user turn would otherwise expose the
+            // <collapsed> summary under a snippable id).
+            isCollapseSummary: isCollapseSummaryMessage(message),
           })
           const lastMessage = last(result)
           if (lastMessage?.type === 'user') {
@@ -2149,8 +2389,8 @@ export function normalizeMessagesForAPI(
           // tool_reference inside the block is a server ValueError.
           // Idempotent: query.ts calls this per-tool-result; the output flows
           // back through here via claude.ts on the next API request. The first
-          // pass's sibling gets a \n[id:xxx] suffix from appendMessageTag below,
-          // so startsWith matches both bare and tagged forms.
+          // pass's sibling gets an internal snip marker from appendMessageTag
+          // below, so startsWith matches both bare and marked forms.
           //
           // Gated OFF when tengu_toolref_defer_j8m is active — that gate
           // enables relocateToolReferenceSiblings in post-processing below,
@@ -2184,6 +2424,22 @@ export function normalizeMessagesForAPI(
                 },
               }
             }
+          }
+
+          // Inject the internal snip id BEFORE merging consecutive user messages.
+          // A parallel-tool assistant turn yields several adjacent tool_result
+          // user messages; mergeUserMessages keeps only the first operand's uuid,
+          // so tagging only after the merge (the sweep below) would expose just
+          // one sibling's id. snipCompactIfNeeded refuses to drop a single result
+          // of such a turn (it would orphan the surviving tool_use), so the model
+          // needs every sibling's id to request the whole-turn removal the snip
+          // prompt tells it to make. Tagging each message here preserves all ids
+          // through the merge (joinTextAtSeam keeps both text blocks) and matches
+          // the live path, where each result is tagged individually at push time
+          // (query.ts). appendMessageTagToUserMessage is idempotent, so the
+          // post-merge sweep below is a no-op for messages already marked here.
+          if (injectSnipTags) {
+            normalizedMessage = appendMessageTagToUserMessage(normalizedMessage)
           }
 
           // If the last message is also a user message, merge them
@@ -2228,7 +2484,7 @@ export function normalizeMessagesForAPI(
                       ...restBlock,
                       name: canonicalName,
                       input: normalizedInput,
-                      ...(getAPIProvider() === 'gemini' && extra_content ? { extra_content } : {})
+                      ...(extra_content ? { extra_content } : {})
                     }
                   }
 
@@ -2240,7 +2496,7 @@ export function normalizeMessagesForAPI(
                     id: block.id,
                     name: canonicalName,
                     input: normalizedInput,
-                    ...(getAPIProvider() === 'gemini' && (block as any).extra_content ? { extra_content: (block as any).extra_content } : {})
+                    ...((block as any).extra_content ? { extra_content: (block as any).extra_content } : {})
                   }
                 }
                 return block
@@ -2347,23 +2603,18 @@ export function normalizeMessagesForAPI(
   // image-in-error tool_result 400s forever.
   const sanitized = sanitizeErrorToolResultContent(smooshed)
 
-  // Append message ID tags for snip tool visibility (after all merging,
-  // so tags always match the surviving message's messageId field).
-  // Skip in test mode — tags change message content hashes, breaking
-  // VCR fixture lookup. Gate must match SnipTool.isEnabled() — don't
-  // inject [id:] tags when the tool isn't available (confuses the model
-  // and wastes tokens on every non-meta user message for every ant).
-  if (feature('HISTORY_SNIP') && process.env.NODE_ENV !== 'test') {
-    const { isSnipRuntimeEnabled } =
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('../services/compact/snipCompact.js') as typeof import('../services/compact/snipCompact.js')
-    if (isSnipRuntimeEnabled()) {
-      for (let i = 0; i < sanitized.length; i++) {
-        if (sanitized[i]!.type === 'user') {
-          sanitized[i] = appendMessageTagToUserMessage(
-            sanitized[i] as UserMessage,
-          )
-        }
+  // Post-merge sweep for internal snip ids. User messages folded in the loop
+  // above are already marked pre-merge (so every parallel-tool sibling's id
+  // survives the merge); this catches user messages synthesized during
+  // normalization that never went through that path — local_command system
+  // messages and attachments promoted to user turns. appendMessageTagToUserMessage
+  // is idempotent, so it is a no-op for anything already marked above.
+  if (injectSnipTags) {
+    for (let i = 0; i < sanitized.length; i++) {
+      if (sanitized[i]!.type === 'user') {
+        sanitized[i] = appendMessageTagToUserMessage(
+          sanitized[i] as UserMessage,
+        )
       }
     }
   }
@@ -2416,10 +2667,19 @@ function isToolResultMessage(msg: Message): boolean {
 export function mergeUserMessages(a: UserMessage, b: UserMessage): UserMessage {
   const lastContent = normalizeUserTextContent(a.message.content)
   const currentContent = normalizeUserTextContent(b.message.content)
+  // A merge that absorbs a collapse summary stays non-snippable: the combined
+  // block holds the only replacement for an archived span, so it must keep the
+  // marker and shed any snip id a real-user operand was tagged with pre-merge.
+  const isCollapseSummary =
+    a.isCollapseSummary || b.isCollapseSummary ? (true as const) : undefined
+  const finalize = (
+    content: string | ContentBlockParam[],
+  ): string | ContentBlockParam[] =>
+    isCollapseSummary ? stripSnipTagsFromContent(content) : content
   if (feature('HISTORY_SNIP')) {
     // A merged message is only meta if ALL merged messages are meta. If any
     // operand is real user content, the result must not be flagged isMeta
-    // (so [id:] tags get injected and it's treated as user-visible content).
+    // (so internal snip ids get injected and it's treated as user-visible content).
     // Gated behind the full runtime check because changing isMeta semantics
     // affects downstream callers (e.g., VCR fixture hashing in SDK harness
     // tests), so this must only fire when snip is actually enabled — not
@@ -2431,11 +2691,12 @@ export function mergeUserMessages(a: UserMessage, b: UserMessage): UserMessage {
       return {
         ...a,
         isMeta: a.isMeta && b.isMeta ? (true as const) : undefined,
+        isCollapseSummary,
         uuid: a.isMeta ? b.uuid : a.uuid,
         message: {
           ...a.message,
-          content: hoistToolResults(
-            joinTextAtSeam(lastContent, currentContent),
+          content: finalize(
+            hoistToolResults(joinTextAtSeam(lastContent, currentContent)),
           ),
         },
       }
@@ -2443,12 +2704,15 @@ export function mergeUserMessages(a: UserMessage, b: UserMessage): UserMessage {
   }
   return {
     ...a,
-    // Preserve the non-meta message's uuid so [id:] tags (derived from uuid)
+    isCollapseSummary,
+    // Preserve the non-meta message's uuid so snip ids (derived from uuid)
     // stay stable across API calls (meta messages like system context get fresh uuids each call)
     uuid: a.isMeta ? b.uuid : a.uuid,
     message: {
       ...a.message,
-      content: hoistToolResults(joinTextAtSeam(lastContent, currentContent)),
+      content: finalize(
+        hoistToolResults(joinTextAtSeam(lastContent, currentContent)),
+      ),
     },
   }
 }
@@ -2794,6 +3058,8 @@ export function getToolUseID(message: NormalizedMessage): string | null {
       return message.subtype === 'informational'
         ? (message.toolUseID ?? null)
         : null
+    default:
+      return null
   }
 }
 
@@ -3063,17 +3329,22 @@ export function handleMessageFromStream(
           const index = message.event.index
           onUpdateLength(delta)
           onStreamingToolUses(_ => {
-            const element = _.find(_ => _.index === index)
-            if (!element) {
-              return _
-            }
-            return [
-              ..._.filter(_ => _ !== element),
-              {
+            // Update in place (preserve array order). The previous
+            // filter-then-append moved the updated tool to the end, which
+            // shuffled concurrently-streaming tools and broke the index-aligned
+            // contentBlock check in the Messages memo comparator.
+            let found = false
+            const next = _.map(element => {
+              if (element.index !== index) {
+                return element
+              }
+              found = true
+              return {
                 ...element,
                 unparsedToolInput: element.unparsedToolInput + delta,
-              },
-            ]
+              }
+            })
+            return found ? next : _
           })
           return
         }
@@ -3666,6 +3937,9 @@ Read the team config to discover your teammates' names. Check the task list peri
       ])
     }
     case 'todo_reminder': {
+      if (isEnvTruthy(process.env.OPENCLAUDE_DISABLE_TOOL_REMINDERS)) {
+        return []
+      }
       const todoItems = attachment.content
         .map((todo, index) => `${index + 1}. [${todo.status}] ${todo.content}`)
         .join('\n')
@@ -3684,6 +3958,9 @@ Read the team config to discover your teammates' names. Check the task list peri
     }
     case 'task_reminder': {
       if (!isTodoV2Enabled()) {
+        return []
+      }
+      if (isEnvTruthy(process.env.OPENCLAUDE_DISABLE_TOOL_REMINDERS)) {
         return []
       }
       const taskItems = attachment.content
@@ -5120,6 +5397,598 @@ export function createToolUseSummaryMessage(
   }
 }
 
+export type ToolResultPairingValidationContext = {
+  phase?: string
+  querySource?: string
+  agentId?: string
+  model?: string
+  provider?: string
+}
+
+export type ToolResultPairingIssueKind =
+  | 'missing_tool_result'
+  | 'orphaned_tool_result'
+  | 'duplicate_tool_use'
+  | 'duplicate_tool_result'
+  | 'server_tool_use_without_result'
+
+export type ToolResultPairingIssue = {
+  kind: ToolResultPairingIssueKind
+  toolUseId: string
+  assistantIndex?: number
+  assistantMessageId?: string
+  userIndex?: number
+  duplicateOfAssistantIndex?: number
+  duplicateOfAssistantMessageId?: string
+}
+
+export type ToolResultPairingValidationResult = {
+  valid: boolean
+  context: ToolResultPairingValidationContext
+  issues: ToolResultPairingIssue[]
+}
+
+export type ToolPairSafeMessageRangeOptions = {
+  projectionName: string
+  querySource?: string
+  allowPendingToolUse?: boolean
+  minStart?: number
+  maxEnd?: number
+  maxExtraMessages?: number
+}
+
+export type ToolPairSafeMessageRangeDiagnostics = {
+  projectionName: string
+  querySource?: string
+  messageCountBefore: number
+  messageCountAfter: number
+  requestedRange: { start: number; end: number }
+  adjustedRange: { start: number; end: number }
+  issueKinds: ToolResultPairingIssueKind[]
+  requestedStartedWithToolResult: boolean
+  adjusted: boolean
+}
+
+export type ToolPairSafeMessageRangeResult<T extends Message> = {
+  messages: T[]
+  start: number
+  end: number
+  diagnostics: ToolPairSafeMessageRangeDiagnostics
+}
+
+function getToolUseId(block: unknown): string | null {
+  if (
+    typeof block === 'object' &&
+    block !== null &&
+    'type' in block &&
+    block.type === 'tool_use' &&
+    'id' in block &&
+    typeof block.id === 'string'
+  ) {
+    return block.id
+  }
+  return null
+}
+
+function getToolResultId(block: unknown): string | null {
+  if (
+    typeof block === 'object' &&
+    block !== null &&
+    'type' in block &&
+    block.type === 'tool_result' &&
+    'tool_use_id' in block &&
+    typeof block.tool_use_id === 'string'
+  ) {
+    return block.tool_use_id
+  }
+  return null
+}
+
+function getServerToolUseId(block: unknown): string | null {
+  if (
+    typeof block === 'object' &&
+    block !== null &&
+    'type' in block &&
+    (block.type === 'server_tool_use' || block.type === 'mcp_tool_use') &&
+    'id' in block &&
+    typeof block.id === 'string'
+  ) {
+    return block.id
+  }
+  return null
+}
+
+function getToolUseIdReference(block: unknown): string | null {
+  if (
+    typeof block === 'object' &&
+    block !== null &&
+    'tool_use_id' in block &&
+    typeof block.tool_use_id === 'string'
+  ) {
+    return block.tool_use_id
+  }
+  return null
+}
+
+function getToolResultIdsFromUserMessage(message: UserMessage): string[] {
+  if (!Array.isArray(message.message.content)) {
+    return []
+  }
+  return message.message.content
+    .map(block => getToolResultId(block))
+    .filter((id): id is string => id !== null)
+}
+
+function isUserOrAssistantMessage(
+  message: Message,
+): message is UserMessage | AssistantMessage {
+  return message.type === 'user' || message.type === 'assistant'
+}
+
+function getToolUseIdsFromAssistantMessage(message: Message): string[] {
+  if (message.type !== 'assistant') {
+    return []
+  }
+  return message.message.content
+    .map(block => getToolUseId(block))
+    .filter((id): id is string => id !== null)
+}
+
+function getToolResultIdsFromMessage(message: Message): string[] {
+  if (message.type !== 'user') {
+    return []
+  }
+  const content = message.message.content
+  if (!Array.isArray(content)) {
+    return []
+  }
+  return content
+    .map(block => getToolResultId(block))
+    .filter((id): id is string => id !== null)
+}
+
+function collectToolUseIdsInRange(
+  messages: Message[],
+  start: number,
+  end: number,
+): Set<string> {
+  const ids = new Set<string>()
+  for (let i = start; i < end; i++) {
+    for (const id of getToolUseIdsFromAssistantMessage(messages[i]!)) {
+      ids.add(id)
+    }
+  }
+  return ids
+}
+
+function collectToolResultIdsInRange(
+  messages: Message[],
+  start: number,
+  end: number,
+): Set<string> {
+  const ids = new Set<string>()
+  for (let i = start; i < end; i++) {
+    for (const id of getToolResultIdsFromMessage(messages[i]!)) {
+      ids.add(id)
+    }
+  }
+  return ids
+}
+
+function clampRangeIndex(index: number, min: number, max: number): number {
+  if (!Number.isFinite(index)) return min
+  return Math.max(min, Math.min(max, Math.trunc(index)))
+}
+
+function findToolUseMessageIndex(
+  messages: Message[],
+  toolUseId: string,
+  fromInclusive: number,
+  toExclusive: number,
+): number {
+  for (let i = toExclusive - 1; i >= fromInclusive; i--) {
+    if (getToolUseIdsFromAssistantMessage(messages[i]!).includes(toolUseId)) {
+      return i
+    }
+  }
+  return -1
+}
+
+function findToolResultMessageIndex(
+  messages: Message[],
+  toolUseId: string,
+  fromInclusive: number,
+  toExclusive: number,
+): number {
+  for (let i = fromInclusive; i < toExclusive; i++) {
+    if (getToolResultIdsFromMessage(messages[i]!).includes(toolUseId)) {
+      return i
+    }
+  }
+  return -1
+}
+
+function findEarliestAssistantWithSameMessageId(
+  messages: Message[],
+  messageId: string,
+  fromInclusive: number,
+  toExclusive: number,
+): number {
+  let result = -1
+  for (let i = fromInclusive; i < toExclusive; i++) {
+    const message = messages[i]!
+    if (message.type === 'assistant' && message.message.id === messageId) {
+      result = i
+      break
+    }
+  }
+  return result
+}
+
+function findLatestAssistantWithSameMessageId(
+  messages: Message[],
+  messageId: string,
+  fromInclusive: number,
+  toExclusive: number,
+): number {
+  let result = -1
+  for (let i = fromInclusive; i < toExclusive; i++) {
+    const message = messages[i]!
+    if (message.type === 'assistant' && message.message.id === messageId) {
+      result = i
+    }
+  }
+  return result
+}
+
+function getPairingIssueKinds(messages: Message[]): ToolResultPairingIssueKind[] {
+  const pairable = messages.filter(isUserOrAssistantMessage)
+  if (pairable.length === 0) return []
+  const validation = validateToolResultPairing(pairable)
+  return [...new Set(validation.issues.map(issue => issue.kind))]
+}
+
+function messageHasToolResult(message: Message | undefined): boolean {
+  return message ? getToolResultIdsFromMessage(message).length > 0 : false
+}
+
+/**
+ * Selects a contiguous message range without cutting through tool_use/tool_result
+ * pairs. Projection producers should call this before slicing history for
+ * summary, compaction, or forked-query contexts.
+ */
+export function selectToolPairSafeMessageRange<T extends Message>(
+  messages: readonly T[],
+  requestedStart: number,
+  requestedEnd: number,
+  options: ToolPairSafeMessageRangeOptions,
+): ToolPairSafeMessageRangeResult<T> {
+  const messageList = [...messages]
+  const minStart = clampRangeIndex(options.minStart ?? 0, 0, messageList.length)
+  const maxEnd = clampRangeIndex(
+    options.maxEnd ?? messageList.length,
+    minStart,
+    messageList.length,
+  )
+  const clampedStart = clampRangeIndex(requestedStart, minStart, maxEnd)
+  const clampedEnd = clampRangeIndex(requestedEnd, clampedStart, maxEnd)
+  const maxExtraMessages =
+    options.maxExtraMessages === undefined
+      ? messageList.length
+      : Math.max(0, Math.trunc(options.maxExtraMessages))
+  let expansionMinStart = Math.max(minStart, clampedStart - maxExtraMessages)
+  let expansionMaxEnd = Math.min(maxEnd, clampedEnd + maxExtraMessages)
+
+  let start = clampedStart
+  let end = clampedEnd
+  const requestedMessages = messageList.slice(clampedStart, clampedEnd)
+  const issueKinds = getPairingIssueKinds(requestedMessages)
+  const requestedStartedWithToolResult = messageHasToolResult(
+    messageList[clampedStart],
+  )
+
+  for (let guard = 0; guard < messageList.length * 2 + 2; guard++) {
+    let changed = false
+
+    for (let i = start; i < end; i++) {
+      const message = messageList[i]!
+      if (message.type !== 'assistant') continue
+      const messageId = message.message.id
+      if (!messageId) continue
+
+      const earlier = findEarliestAssistantWithSameMessageId(
+        messageList,
+        messageId,
+        0,
+        start,
+      )
+      if (earlier !== -1) {
+        if (earlier >= expansionMinStart) {
+          start = earlier
+        } else {
+          const lastInRange = findLatestAssistantWithSameMessageId(
+            messageList,
+            messageId,
+            start,
+            end,
+          )
+          start = lastInRange + 1
+          expansionMinStart = Math.max(expansionMinStart, start)
+        }
+        changed = true
+        break
+      }
+
+      const later = findLatestAssistantWithSameMessageId(
+        messageList,
+        messageId,
+        end,
+        messageList.length,
+      )
+      if (later !== -1) {
+        if (later < expansionMaxEnd) {
+          end = later + 1
+        } else {
+          const firstInRange = findEarliestAssistantWithSameMessageId(
+            messageList,
+            messageId,
+            start,
+            end,
+          )
+          end = firstInRange
+          expansionMaxEnd = Math.min(expansionMaxEnd, end)
+        }
+        changed = true
+        break
+      }
+    }
+    if (changed) continue
+
+    const toolUseIds = collectToolUseIdsInRange(messageList, start, end)
+    const toolResultIds = collectToolResultIdsInRange(messageList, start, end)
+
+    for (let i = start; i < end; i++) {
+      const resultIds = getToolResultIdsFromMessage(messageList[i]!)
+      const orphanedResultId = resultIds.find(id => !toolUseIds.has(id))
+      if (!orphanedResultId) continue
+
+      const toolUseIndex = findToolUseMessageIndex(
+        messageList,
+        orphanedResultId,
+        expansionMinStart,
+        start,
+      )
+      if (toolUseIndex !== -1) {
+        start = toolUseIndex
+        changed = true
+        break
+      }
+
+      start = i + 1
+      expansionMinStart = Math.max(expansionMinStart, start)
+      changed = true
+      break
+    }
+    if (changed) continue
+
+    for (let i = start; i < end; i++) {
+      const toolUseIdsForMessage = getToolUseIdsFromAssistantMessage(
+        messageList[i]!,
+      )
+      const missingToolUseId = toolUseIdsForMessage.find(
+        id => !toolResultIds.has(id),
+      )
+      if (!missingToolUseId) continue
+
+      const toolResultIndex = findToolResultMessageIndex(
+        messageList,
+        missingToolUseId,
+        end,
+        expansionMaxEnd,
+      )
+      if (toolResultIndex !== -1) {
+        end = toolResultIndex + 1
+        changed = true
+        break
+      }
+
+      const hasResultOutsideRange =
+        findToolResultMessageIndex(
+          messageList,
+          missingToolUseId,
+          0,
+          messageList.length,
+        ) !== -1
+      if (options.allowPendingToolUse && !hasResultOutsideRange) continue
+
+      end = i
+      expansionMaxEnd = Math.min(expansionMaxEnd, end)
+      changed = true
+      break
+    }
+    if (!changed) break
+  }
+
+  const selectedMessages = messageList.slice(start, end)
+  const diagnostics: ToolPairSafeMessageRangeDiagnostics = {
+    projectionName: options.projectionName,
+    querySource: options.querySource,
+    messageCountBefore: clampedEnd - clampedStart,
+    messageCountAfter: selectedMessages.length,
+    requestedRange: { start: clampedStart, end: clampedEnd },
+    adjustedRange: { start, end },
+    issueKinds,
+    requestedStartedWithToolResult,
+    adjusted: start !== clampedStart || end !== clampedEnd,
+  }
+
+  if (diagnostics.adjusted || issueKinds.length > 0) {
+    logForDebugging(
+      `[messageProjection] tool-pair-safe range projection=${options.projectionName} ` +
+        `querySource=${options.querySource ?? 'unknown'} ` +
+        `before=${diagnostics.messageCountBefore} after=${diagnostics.messageCountAfter} ` +
+        `requested=${clampedStart}:${clampedEnd} adjusted=${start}:${end} ` +
+        `issueKinds=${issueKinds.join(',') || 'none'} ` +
+        `requestedStartedWithToolResult=${requestedStartedWithToolResult}`,
+    )
+  }
+
+  return {
+    messages: selectedMessages as T[],
+    start,
+    end,
+    diagnostics,
+  }
+}
+
+export function validateToolResultPairing(
+  messages: (UserMessage | AssistantMessage)[],
+  context: ToolResultPairingValidationContext = {},
+): ToolResultPairingValidationResult {
+  const issues: ToolResultPairingIssue[] = []
+  const seenToolUses = new Map<
+    string,
+    { assistantIndex: number; assistantMessageId: string }
+  >()
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!
+
+    if (msg.type === 'user') {
+      if (messages[i - 1]?.type === 'assistant') {
+        continue
+      }
+      for (const toolUseId of getToolResultIdsFromUserMessage(msg)) {
+        issues.push({
+          kind: 'orphaned_tool_result',
+          toolUseId,
+          userIndex: i,
+        })
+      }
+      continue
+    }
+
+    const uniqueToolUseIds = new Set<string>()
+    const serverResultIds = new Set<string>()
+    for (const block of msg.message.content) {
+      const toolUseIdReference = getToolUseIdReference(block)
+      if (toolUseIdReference !== null) {
+        serverResultIds.add(toolUseIdReference)
+      }
+    }
+
+    for (const block of msg.message.content) {
+      const toolUseId = getToolUseId(block)
+      if (toolUseId !== null) {
+        const firstSeen = seenToolUses.get(toolUseId)
+        if (firstSeen) {
+          issues.push({
+            kind: 'duplicate_tool_use',
+            toolUseId,
+            assistantIndex: i,
+            assistantMessageId: msg.message.id,
+            duplicateOfAssistantIndex: firstSeen.assistantIndex,
+            duplicateOfAssistantMessageId: firstSeen.assistantMessageId,
+          })
+        } else {
+          seenToolUses.set(toolUseId, {
+            assistantIndex: i,
+            assistantMessageId: msg.message.id,
+          })
+        }
+
+        uniqueToolUseIds.add(toolUseId)
+      }
+
+      const serverToolUseId = getServerToolUseId(block)
+      if (
+        serverToolUseId !== null &&
+        !serverResultIds.has(serverToolUseId)
+      ) {
+        issues.push({
+          kind: 'server_tool_use_without_result',
+          toolUseId: serverToolUseId,
+          assistantIndex: i,
+          assistantMessageId: msg.message.id,
+        })
+      }
+    }
+
+    const nextMsg = messages[i + 1]
+    const toolResultIds =
+      nextMsg?.type === 'user' ? getToolResultIdsFromUserMessage(nextMsg) : []
+    const toolResultIdSet = new Set(toolResultIds)
+    const toolUseIdSet = new Set(uniqueToolUseIds)
+    const seenToolResultIds = new Set<string>()
+
+    for (const toolResultId of toolResultIds) {
+      if (seenToolResultIds.has(toolResultId)) {
+        issues.push({
+          kind: 'duplicate_tool_result',
+          toolUseId: toolResultId,
+          assistantIndex: i,
+          assistantMessageId: msg.message.id,
+          userIndex: i + 1,
+        })
+      }
+      seenToolResultIds.add(toolResultId)
+    }
+
+    for (const toolUseId of toolUseIdSet) {
+      if (!toolResultIdSet.has(toolUseId)) {
+        issues.push({
+          kind: 'missing_tool_result',
+          toolUseId,
+          assistantIndex: i,
+          assistantMessageId: msg.message.id,
+        })
+      }
+    }
+
+    for (const toolResultId of toolResultIdSet) {
+      if (!toolUseIdSet.has(toolResultId)) {
+        issues.push({
+          kind: 'orphaned_tool_result',
+          toolUseId: toolResultId,
+          assistantIndex: i,
+          assistantMessageId: msg.message.id,
+          userIndex: i + 1,
+        })
+      }
+    }
+  }
+
+  return {
+    valid: issues.length === 0,
+    context,
+    issues,
+  }
+}
+
+function formatToolResultPairingIssue(
+  issue: ToolResultPairingIssue,
+): string {
+  const parts = [`kind=${issue.kind}`, `tool_use_id=${issue.toolUseId}`]
+  if (issue.assistantIndex !== undefined) {
+    parts.push(`assistant_index=${issue.assistantIndex}`)
+  }
+  if (issue.assistantMessageId !== undefined) {
+    parts.push(`assistant_message_id=${issue.assistantMessageId}`)
+  }
+  if (issue.userIndex !== undefined) {
+    parts.push(`user_index=${issue.userIndex}`)
+  }
+  if (issue.duplicateOfAssistantIndex !== undefined) {
+    parts.push(`duplicate_of_assistant_index=${issue.duplicateOfAssistantIndex}`)
+  }
+  if (issue.duplicateOfAssistantMessageId !== undefined) {
+    parts.push(
+      `duplicate_of_assistant_message_id=${issue.duplicateOfAssistantMessageId}`,
+    )
+  }
+  return parts.join(',')
+}
+
 /**
  * Defensive validation: ensure tool_use/tool_result pairing is correct.
  *
@@ -5137,6 +6006,7 @@ export function createToolUseSummaryMessage(
  */
 export function ensureToolResultPairing(
   messages: (UserMessage | AssistantMessage)[],
+  context: ToolResultPairingValidationContext = {},
 ): (UserMessage | AssistantMessage)[] {
   const result: (UserMessage | AssistantMessage)[] = []
   let repaired = false
@@ -5405,6 +6275,7 @@ export function ensureToolResultPairing(
   }
 
   if (repaired) {
+    const validation = validateToolResultPairing(messages, context)
     // Capture diagnostic info to help identify root cause
     const messageTypes = messages.map((m, idx) => {
       if (m.type === 'assistant') {
@@ -5443,20 +6314,46 @@ export function ensureToolResultPairing(
       throw new Error(
         `ensureToolResultPairing: tool_use/tool_result pairing mismatch detected (strict mode). ` +
           `Refusing to repair — would inject synthetic placeholders into model context. ` +
+          `Phase: ${validation.context.phase ?? 'unknown'}. ` +
+          `Issues: ${validation.issues.map(formatToolResultPairingIssue).join('; ') || 'none'}. ` +
           `Message structure: ${messageTypes.join('; ')}. See inc-4977.`,
       )
     }
 
+    const issueKinds = [
+      ...new Set(validation.issues.map(issue => issue.kind)),
+    ].join(',')
+    const issueSummary =
+      validation.issues.map(formatToolResultPairingIssue).join('; ') || 'none'
+    const diagnosticContext =
+      `Phase: ${validation.context.phase ?? 'unknown'}. ` +
+      `Query source: ${validation.context.querySource ?? 'unknown'}. ` +
+      `Provider: ${validation.context.provider ?? 'unknown'}. ` +
+      `Model: ${validation.context.model ?? 'unknown'}. ` +
+      `Issues: ${issueSummary}.`
     logEvent('tengu_tool_result_pairing_repaired', {
       messageCount: messages.length,
       repairedMessageCount: result.length,
+      issueCount: validation.issues.length,
+      phase: (validation.context.phase ??
+        'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      querySource: (validation.context.querySource ??
+        'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      agentId: (validation.context.agentId ??
+        'none') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      model: (validation.context.model ??
+        'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      provider: (validation.context.provider ??
+        'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      issueKinds: (issueKinds ||
+        'none') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       messageTypes: messageTypes.join(
         '; ',
       ) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     })
     logError(
       new Error(
-        `ensureToolResultPairing: repaired missing tool_result blocks (${messages.length} -> ${result.length} messages). Message structure: ${messageTypes.join('; ')}`,
+        `ensureToolResultPairing: repaired missing tool_result blocks (${messages.length} -> ${result.length} messages). ${diagnosticContext} Message structure: ${messageTypes.join('; ')}`,
       ),
     )
   }

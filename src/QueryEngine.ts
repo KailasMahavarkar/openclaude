@@ -14,10 +14,11 @@ import type {
   SDKStatus,
   SDKUserMessageReplay,
 } from 'src/entrypoints/agentSdkTypes.js'
+import { EXTERNAL_PERMISSION_MODES } from 'src/types/permissions.js'
 import { accumulateUsage, updateUsage } from 'src/services/api/claude.js'
 import type { NonNullableUsage } from 'src/services/api/logging.js'
 import { EMPTY_USAGE } from 'src/services/api/logging.js'
-import stripAnsi from 'strip-ansi'
+import { stripVTControlCharacters as stripAnsi } from 'node:util'
 import type { Command } from './commands.js'
 import { getSlashCommandToolSkills } from './commands.js'
 import {
@@ -32,8 +33,10 @@ import {
 import type { CanUseToolFn } from './hooks/useCanUseTool.js'
 import { loadMemoryPrompt } from './memdir/memdir.js'
 import { hasAutoMemPathOverride } from './memdir/paths.js'
-import { query } from './query.js'
+import { query as defaultQuery } from './query.js'
 import { categorizeRetryableAPIError } from './services/api/errors.js'
+import type { AutoCompactTrackingState } from './services/compact/autoCompact.js'
+import { toSDKGoalStatusMessage } from './services/goal/sdk.js'
 import type { MCPServerConnection } from './services/mcp/types.js'
 import type { AppState } from './state/AppState.js'
 import { type Tools, type ToolUseContext, toolMatchesName } from './Tool.js'
@@ -42,6 +45,8 @@ import { SYNTHETIC_OUTPUT_TOOL_NAME } from './tools/SyntheticOutputTool/Syntheti
 import type { Message } from './types/message.js'
 import type { OrphanedPermission } from './types/textInputTypes.js'
 import { createAbortController } from './utils/abortController.js'
+import { validateArrayOf, assertNonEmptyString, assertObject, assertFunction } from './utils/validation.js'
+import { invalidateRemovedToolSchemas } from './utils/toolSchemaCache.js'
 import type { AttributionState } from './utils/commitAttribution.js'
 import { getGlobalConfig } from './utils/config.js'
 import { getCwd } from './utils/cwd.js'
@@ -60,7 +65,11 @@ import {
 import { headlessProfilerCheckpoint } from './utils/headlessProfiler.js'
 import { registerStructuredOutputEnforcement } from './utils/hooks/hookHelpers.js'
 import { getInMemoryErrors } from './utils/log.js'
-import { countToolCalls, SYNTHETIC_MESSAGES } from './utils/messages.js'
+import {
+  countToolCalls,
+  isCompactBoundaryMessage,
+  SYNTHETIC_MESSAGES,
+} from './utils/messages.js'
 import {
   getMainLoopModel,
   parseUserSpecifiedModel,
@@ -82,12 +91,7 @@ import {
   shouldEnableThinkingByDefault,
   type ThinkingConfig,
 } from './utils/thinking.js'
-
-// Lazy: MessageSelector.tsx pulls React/ink; only needed for message filtering at query time
-/* eslint-disable @typescript-eslint/no-require-imports */
-const messageSelector =
-  (): typeof import('src/components/MessageSelector.js') =>
-    require('src/components/MessageSelector.js')
+import { selectableUserMessagesFilter } from './utils/messageFilters.js'
 
 import {
   localCommandOutputToSDKAssistantMessage,
@@ -120,9 +124,6 @@ const getCoordinatorUserContext: (
 
 // Dead code elimination: conditional import for snip compaction
 /* eslint-disable @typescript-eslint/no-require-imports */
-const snipModule = feature('HISTORY_SNIP')
-  ? (require('./services/compact/snipCompact.js') as typeof import('./services/compact/snipCompact.js'))
-  : null
 const snipProjection = feature('HISTORY_SNIP')
   ? (require('./services/compact/snipProjection.js') as typeof import('./services/compact/snipProjection.js'))
   : null
@@ -171,6 +172,7 @@ export type QueryEngineConfig = {
     yieldedSystemMsg: Message,
     store: Message[],
   ) => { messages: Message[]; executed: boolean } | undefined
+  query?: typeof defaultQuery
 }
 
 /**
@@ -190,6 +192,7 @@ export class QueryEngine {
   private totalUsage: NonNullableUsage
   private hasHandledOrphanedPermission = false
   private readFileState: FileStateCache
+  private autoCompactTracking: AutoCompactTrackingState | undefined
   // Turn-scoped skill discovery tracking (feeds was_discovered on
   // tengu_skill_tool_invocation). Must persist across the two
   // processUserInputContext rebuilds inside submitMessage, but is cleared
@@ -335,7 +338,7 @@ export class QueryEngine {
 
     let processUserInputContext: ProcessUserInputContext = {
       messages: this.mutableMessages,
-      // Slash commands that mutate the message array (e.g. /force-snip)
+      // Slash commands that mutate the message array (e.g. /clear)
       // call setMessages(fn).  In interactive mode this writes back to
       // AppState; in print mode we write back to mutableMessages so the
       // rest of the query loop (push at :389, snapshot at :392) sees
@@ -360,7 +363,7 @@ export class QueryEngine {
         isNonInteractiveSession: true,
         customSystemPrompt,
         appendSystemPrompt,
-        agentDefinitions: { activeAgents: agents, allAgents: [] },
+        agentDefinitions: { activeAgents: agents, allAgents: agents },
         theme: resolveThemeSetting(getGlobalConfig().theme),
         maxBudgetUsd,
       },
@@ -430,6 +433,13 @@ export class QueryEngine {
 
     // Push new messages, including user input and any attachments
     this.mutableMessages.push(...messagesFromUserInput)
+    if (messagesFromUserInput.some(isCompactBoundaryMessage)) {
+      this.autoCompactTracking = undefined
+    }
+
+    // NOTE: Message-count and memory-pressure forceReason checks now live in
+    // src/query.ts (the shared query path used by both REPL and SDK), so they
+    // no longer need to be duplicated here in QueryEngine.
 
     // Update params to reflect updates from processing /slash commands
     const messages = [...this.mutableMessages]
@@ -469,7 +479,7 @@ export class QueryEngine {
         (msg.type === 'user' &&
           !msg.isMeta && // Skip synthetic caveat messages
           !msg.toolUseResult && // Skip tool results (they'll be acked from query)
-          messageSelector().selectableUserMessagesFilter(msg)) || // Skip non-user-authored messages (task notifications, etc.)
+          selectableUserMessagesFilter(msg)) || // Skip non-user-authored messages (task notifications, etc.)
         (msg.type === 'system' && msg.subtype === 'compact_boundary'), // Always ack compact boundaries
     )
     const messagesToAck = replayUserMessages ? replayableMessages : []
@@ -509,7 +519,7 @@ export class QueryEngine {
         customSystemPrompt,
         appendSystemPrompt,
         theme: resolveThemeSetting(getGlobalConfig().theme),
-        agentDefinitions: { activeAgents: agents, allAgents: [] },
+        agentDefinitions: { activeAgents: agents, allAgents: agents },
         maxBudgetUsd,
       },
       getAppState,
@@ -538,12 +548,18 @@ export class QueryEngine {
     ])
     headlessProfilerCheckpoint('after_skills_plugins')
 
+    const rawPermissionMode = initialAppState.toolPermissionContext.mode
+    const validPermissionMode: PermissionMode = (
+      EXTERNAL_PERMISSION_MODES as readonly string[]
+    ).includes(rawPermissionMode)
+      ? (rawPermissionMode as PermissionMode)
+      : 'default'
+
     yield buildSystemInitMessage({
       tools,
       mcpClients,
       model: mainLoopModel,
-      permissionMode: initialAppState.toolPermissionContext
-        .mode as PermissionMode, // TODO: avoid the cast
+      permissionMode: validPermissionMode,
       commands,
       agents,
       skills,
@@ -641,7 +657,7 @@ export class QueryEngine {
 
     if (fileHistoryEnabled() && persistSession) {
       messagesFromUserInput
-        .filter(messageSelector().selectableUserMessagesFilter)
+        .filter(selectableUserMessagesFilter)
         .forEach(message => {
           void fileHistoryMakeSnapshot(
             (updater: (prev: FileHistoryState) => FileHistoryState) => {
@@ -673,7 +689,8 @@ export class QueryEngine {
       ? countToolCalls(this.mutableMessages, SYNTHETIC_OUTPUT_TOOL_NAME)
       : 0
 
-    for await (const message of query({
+    const runQuery = this.config.query ?? defaultQuery
+    for await (const message of runQuery({
       messages,
       systemPrompt,
       userContext,
@@ -684,6 +701,10 @@ export class QueryEngine {
       querySource: 'sdk',
       maxTurns,
       taskBudget,
+      autoCompactTracking: this.autoCompactTracking,
+      onAutoCompactTrackingChange: tracking => {
+        this.autoCompactTracking = tracking
+      },
     })) {
       // Record assistant, user, and compact boundary messages
       if (
@@ -832,7 +853,10 @@ export class QueryEngine {
           if (includePartialMessages) {
             yield {
               type: 'stream_event' as const,
-              event: message.event,
+              // The generated SDK type erases the event union to
+              // Record<string, unknown>; BetaRawMessageStreamEvent interfaces
+              // lack an index signature, so a direct assignment is rejected.
+              event: message.event as unknown as Record<string, unknown>,
               session_id: getSessionId(),
               parent_tool_use_id: null,
               uuid: randomUUID(),
@@ -922,8 +946,24 @@ export class QueryEngine {
           )
           if (snipResult !== undefined) {
             if (snipResult.executed) {
-              this.mutableMessages.length = 0
-              this.mutableMessages.push(...snipResult.messages)
+              this.mutableMessages.splice(
+                0,
+                this.mutableMessages.length,
+                ...snipResult.messages,
+              )
+              // Persist the snip boundary so a resumed session replays the same
+              // removal. recordTranscript is append-only by UUID, so the
+              // pre-snip messages already on disk remain; appending this
+              // boundary (which carries snipMetadata.removedUuids) lets
+              // applySnipRemovals prune them in loadTranscriptFile(). Without
+              // this, --resume/restart rebuilds the un-snipped history and the
+              // context reduction is lost. Mirror the boundary into the local
+// `messages` recording copy — like the compact_boundary path —
+              // so later writes and the parent chain stay consistent.
+              messages.push(message)
+              if (persistSession) {
+                await recordTranscript(messages)
+              }
             }
             break
           }
@@ -967,6 +1007,8 @@ export class QueryEngine {
               uuid: message.uuid,
             }
           }
+          const goalStatusMessage = toSDKGoalStatusMessage(message)
+          if (goalStatusMessage) yield goalStatusMessage
           // Don't yield other system messages in headless mode
           break
         }
@@ -1022,10 +1064,11 @@ export class QueryEngine {
           SYNTHETIC_OUTPUT_TOOL_NAME,
         )
         const callsThisQuery = currentCalls - initialStructuredOutputCalls
-        const maxRetries = parseInt(
+        const parsed = parseInt(
           process.env.MAX_STRUCTURED_OUTPUT_RETRIES || '5',
           10,
         )
+        const maxRetries = Number.isNaN(parsed) ? 5 : parsed
         if (callsThisQuery >= maxRetries) {
           if (persistSession) {
             if (
@@ -1177,6 +1220,109 @@ export class QueryEngine {
     return this.mutableMessages
   }
 
+  /**
+   * Inject messages into the engine's message store.
+   * Used by SDK query() when fork=true to resume from a forked session.
+   */
+  injectMessages(messages: Message[]): void {
+    const validated = validateArrayOf(messages, (msg, _i) => {
+      const m = msg as Record<string, unknown>
+      assertNonEmptyString(m.type, 'type')
+      if (m.message !== undefined) {
+        assertObject(m.message, 'message')
+        const inner = m.message as Record<string, unknown>
+        if (inner.role !== undefined) {
+          assertNonEmptyString(inner.role, 'message.role')
+        }
+        if (inner.content !== undefined && typeof inner.content !== 'string' && !Array.isArray(inner.content)) {
+          throw new TypeError("'message.content' must be a string or array")
+        }
+      }
+      // `messages` is declared Message[]; the runtime checks above only guard
+      // untyped SDK callers. The validator param is `unknown` by design.
+      return msg as Message
+    }, 'injectMessages')
+    this.mutableMessages.push(...validated)
+  }
+
+  /**
+   * Inject agent definitions into the engine's config.
+   * Used by SDK to load agents after engine creation (async loading).
+   * Validates that agents have the internal format fields
+   * (agentType, whenToUse, getSystemPrompt) since SDK agents
+   * are converted to this format before injection.
+   */
+  injectAgents(agents: AgentDefinition[]): void {
+    const validated = validateArrayOf(agents, (agent, _i) => {
+      const a = agent as Record<string, unknown>
+      assertNonEmptyString(a.agentType, 'agentType')
+      assertNonEmptyString(a.whenToUse, 'whenToUse')
+      if (typeof a.getSystemPrompt !== 'function') {
+        throw new TypeError("missing or invalid 'getSystemPrompt' (expected function)")
+      }
+      if (a.tools !== undefined) {
+        const validToolNames = new Set(this.config.tools.map(t => t.name))
+        for (const toolSpec of a.tools as string[]) {
+          // Wildcard '*' means all tools are allowed - skip validation
+          if (toolSpec === '*') continue
+          // Parse tool spec to get base tool name (may contain permission rules)
+          const toolName = toolSpec.split(':')[0] ?? toolSpec
+          if (!validToolNames.has(toolName)) {
+            throw new TypeError(`agent references unknown tool '${toolSpec}'`)
+          }
+        }
+      }
+      // `agents` is declared AgentDefinition[]; the runtime checks above only
+      // guard untyped SDK callers. The validator param is `unknown` by design.
+      return agent as AgentDefinition
+    }, 'injectAgents')
+    this.config.agents = validated
+  }
+
+  /**
+   * Update the engine's tool list dynamically.
+   * Used by SDK setPermissionMode to refresh tools when permission mode changes.
+   */
+  updateTools(tools: Tools): void {
+    if (!Array.isArray(tools) && !(Symbol.iterator in Object(tools))) {
+      throw new TypeError(`updateTools: expected iterable, got ${typeof tools}`)
+    }
+    const toolArray = Array.from(tools as Iterable<unknown>)
+
+    // Phase 1: Validate new tools
+    validateArrayOf(toolArray, (tool, _i) => {
+      const t = tool as Record<string, unknown>
+      assertNonEmptyString(t.name, 'name')
+      assertFunction(t.call, 'call')
+      return tool
+    }, 'updateTools')
+
+    // Phase 2: Validate agent compatibility BEFORE commit (transactional)
+    const validToolNames = new Set(toolArray.map(t => (t as Record<string, unknown>).name as string))
+    for (const agent of this.config.agents) {
+      if (agent.tools) {
+        for (const toolSpec of agent.tools) {
+          if (toolSpec === '*') continue
+          const toolName = toolSpec.split(':')[0] ?? toolSpec
+          if (!validToolNames.has(toolName)) {
+            throw new TypeError(
+              `updateTools: agent '${agent.agentType}' references tool '${toolSpec}' which is not in the new tool set`
+            )
+          }
+        }
+      }
+    }
+
+    // Phase 3: Commit — only reached if all validations pass
+    this.config.tools = toolArray as Tools
+
+    // Phase 4: Invalidate schema cache for removed tools only.
+    // Selective invalidation preserves cached schemas for tools that remain,
+    // avoiding unnecessary recomputation for concurrent engines in multi-session
+    // SDK scenarios. New tools (not yet cached) will be computed on first render.
+    invalidateRemovedToolSchemas(validToolNames)
+  }
+
   getReadFileState(): FileStateCache {
     return this.readFileState
   }
@@ -1187,6 +1333,30 @@ export class QueryEngine {
 
   setModel(model: string): void {
     this.config.userSpecifiedModel = model
+  }
+
+  /**
+   * Update the engine's thinking config dynamically.
+   * Used by SDK setMaxThinkingTokens to change the thinking token budget.
+   */
+  setThinkingConfig(config: ThinkingConfig): void {
+    this.config.thinkingConfig = config
+  }
+
+  /**
+   * Get MCP server connections. Returns a readonly array to prevent
+   * external mutation (use setMcpClients or updateTools to modify).
+   */
+  getMcpClients(): readonly MCPServerConnection[] {
+    return this.config.mcpClients
+  }
+
+  /**
+   * Set MCP server connections. Replaces the entire mcpClients array.
+   * Used by SDK to inject session-scoped MCP servers after connection.
+   */
+  setMcpClients(clients: MCPServerConnection[]): void {
+    this.config.mcpClients = clients
   }
 }
 
@@ -1292,7 +1462,17 @@ export async function* ask({
           snipReplay: (yielded: Message, store: Message[]) => {
             if (!snipProjection!.isSnipBoundaryMessage(yielded))
               return undefined
-            return snipModule!.snipCompactIfNeeded(store, { force: true })
+            // The pending set was already consumed in query.ts when the
+            // boundary was produced, so prune the store by the boundary's own
+            // removedUuids. Keep the boundary as the marker for later replays.
+            const projected = snipProjection!.projectSnippedView([
+              ...store,
+              yielded,
+            ])
+            return {
+              messages: projected,
+              executed: projected.length !== store.length + 1,
+            }
           },
         }
       : {}),

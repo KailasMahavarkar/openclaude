@@ -4,11 +4,13 @@ import autofixPr from './commands/autofix-pr/index.js'
 import backfillSessions from './commands/backfill-sessions/index.js'
 import btw from './commands/btw/index.js'
 import goodClaude from './commands/good-claude/index.js'
+import goal from './commands/goal/index.js'
 import issue from './commands/issue/index.js'
 import feedback from './commands/feedback/index.js'
 import clear from './commands/clear/index.js'
 import color from './commands/color/index.js'
 import commit from './commands/commit.js'
+import commitMessage from './commands/commit-message/index.js'
 import copy from './commands/copy/index.js'
 import desktop from './commands/desktop/index.js'
 import commitPushPr from './commands/commit-push-pr.js'
@@ -21,24 +23,33 @@ import dream from './commands/dream/index.js'
 import ctx_viz from './commands/ctx_viz/index.js'
 import doctor from './commands/doctor/index.js'
 import onboardGithub from './commands/onboard-github/index.js'
+import knowledge from './commands/knowledge/index.js'
 import memory from './commands/memory/index.js'
 import help from './commands/help/index.js'
 import ide from './commands/ide/index.js'
 import init from './commands/init.js'
 import initVerifiers from './commands/init-verifiers.js'
 import keybindings from './commands/keybindings/index.js'
+import lsp from './commands/lsp/index.js'
 import login from './commands/login/index.js'
 import logout from './commands/logout/index.js'
 import installGitHubApp from './commands/install-github-app/index.js'
 import installSlackApp from './commands/install-slack-app/index.js'
 import breakCache from './commands/break-cache/index.js'
+import cacheProbe from './commands/cache-probe/index.js'
+import cacheStats from './commands/cacheStats/index.js'
 import mcp from './commands/mcp/index.js'
 import mobile from './commands/mobile/index.js'
 import onboarding from './commands/onboarding/index.js'
 import pr_comments from './commands/pr_comments/index.js'
 import releaseNotes from './commands/release-notes/index.js'
 import rename from './commands/rename/index.js'
-import resume from './commands/resume/index.js'
+import replay from './commands/replay/index.js'
+import {
+  requestSize,
+  requestSizeNonInteractive,
+} from './commands/request-size/index.js'
+import resume, { continueCommand } from './commands/resume/index.js'
 import review, { ultrareview } from './commands/review.js'
 import session from './commands/session/index.js'
 import share from './commands/share/index.js'
@@ -54,9 +65,12 @@ const agentsPlatform =
 /* eslint-enable @typescript-eslint/no-require-imports */
 import securityReview from './commands/security-review.js'
 import bughunter from './commands/bughunter/index.js'
+import bughunterSecurity from './commands/bughunter-security/index.js'
+import bughunterPerf from './commands/bughunter-perf/index.js'
 import terminalSetup from './commands/terminalSetup/index.js'
 import usage from './commands/usage/index.js'
 import theme from './commands/theme/index.js'
+import logo from './commands/logo/index.js'
 import vim from './commands/vim/index.js'
 import { feature } from 'bun:bundle'
 import { isBuddyEnabled } from './buddy/feature.js'
@@ -82,9 +96,6 @@ const remoteControlServerCommand =
     : null
 const voiceCommand = feature('VOICE_MODE')
   ? require('./commands/voice/index.js').default
-  : null
-const forceSnip = feature('HISTORY_SNIP')
-  ? require('./commands/force-snip.js').default
   : null
 const workflowsCmd = feature('WORKFLOW_SCRIPTS')
   ? (
@@ -113,11 +124,6 @@ const peersCmd = feature('UDS_INBOX')
       require('./commands/peers/index.js') as typeof import('./commands/peers/index.js')
     ).default
   : null
-const forkCmd = feature('FORK_SUBAGENT')
-  ? (
-      require('./commands/fork/index.js') as typeof import('./commands/fork/index.js')
-    ).default
-  : null
 const buddy = isBuddyEnabled()
   ? (
       require('./commands/buddy/index.js') as typeof import('./commands/buddy/index.js')
@@ -136,6 +142,7 @@ import hooks from './commands/hooks/index.js'
 import files from './commands/files/index.js'
 import branch from './commands/branch/index.js'
 import agents from './commands/agents/index.js'
+import autoFix from './commands/auto-fix.js'
 import plugin from './commands/plugin/index.js'
 import reloadPlugins from './commands/reload-plugins/index.js'
 import rewind from './commands/rewind/index.js'
@@ -143,6 +150,8 @@ import heapDump from './commands/heapdump/index.js'
 import mockLimits from './commands/mock-limits/index.js'
 import bridgeKick from './commands/bridge-kick.js'
 import version from './commands/version.js'
+import update from './commands/update/index.js'
+import wiki from './commands/wiki/index.js'
 import summary from './commands/summary/index.js'
 import {
   resetLimits,
@@ -154,6 +163,7 @@ import sandboxToggle from './commands/sandbox-toggle/index.js'
 import chrome from './commands/chrome/index.js'
 import stickers from './commands/stickers/index.js'
 import advisor from './commands/advisor.js'
+import ads from './commands/ads.js'
 import { logError } from './utils/log.js'
 import { toError } from './utils/errors.js'
 import { logForDebugging } from './utils/debug.js'
@@ -163,6 +173,10 @@ import {
   getDynamicSkills,
 } from './skills/loadSkillsDir.js'
 import { getBundledSkills } from './skills/bundledSkills.js'
+import {
+  getOpenClaudeCommandDescriptionKey,
+  localize,
+} from './i18n/index.js'
 import { getBuiltinPluginSkillCommands } from './plugins/builtinPlugins.js'
 import {
   getPluginCommands,
@@ -194,7 +208,7 @@ import stats from './commands/stats/index.js'
 const usageReport: Command = {
   type: 'prompt',
   name: 'insights',
-  description: 'Generate a report analyzing your Claude Code sessions',
+  description: 'Generate a report analyzing your OpenClaude sessions',
   contentLength: 0,
   progressMessage: 'analyzing your sessions',
   source: 'builtin',
@@ -210,6 +224,7 @@ import { getSettingSourceName } from './utils/settings/constants.js'
 import {
   type Command,
   getCommandName,
+  isCommand,
   isCommandEnabled,
 } from './types/command.js'
 
@@ -229,14 +244,11 @@ export { getCommandName, isCommandEnabled } from './types/command.js'
 export const INTERNAL_ONLY_COMMANDS = [
   backfillSessions,
   breakCache,
-  bughunter,
   commit,
   commitPushPr,
-  ctx_viz,
   goodClaude,
   issue,
   initVerifiers,
-  ...(forceSnip ? [forceSnip] : []),
   mockLimits,
   bridgeKick,
   version,
@@ -262,19 +274,29 @@ export const INTERNAL_ONLY_COMMANDS = [
 const COMMANDS = memoize((): Command[] => [
   addDir,
   advisor,
+  ads,
   agents,
+  autoFix,
   branch,
+  bughunter,
+  bughunterSecurity,
+  bughunterPerf,
   btw,
+  cacheProbe,
+  cacheStats,
   chrome,
   clear,
   color,
   compact,
+  commitMessage,
   config,
+  continueCommand,
   copy,
   desktop,
   context,
   contextNonInteractive,
   cost,
+  ctx_viz,
   diff,
   dream,
   doctor,
@@ -287,6 +309,8 @@ const COMMANDS = memoize((): Command[] => [
   ide,
   init,
   keybindings,
+  knowledge,
+  lsp,
   installGitHubApp,
   installSlackApp,
   mcp,
@@ -302,6 +326,9 @@ const COMMANDS = memoize((): Command[] => [
   releaseNotes,
   reloadPlugins,
   rename,
+  replay,
+  requestSize,
+  requestSizeNonInteractive,
   resume,
   session,
   skills,
@@ -311,12 +338,15 @@ const COMMANDS = memoize((): Command[] => [
   stickers,
   tag,
   theme,
+  logo,
   feedback,
+  goal,
   review,
   ultrareview,
   rewind,
   securityReview,
   terminalSetup,
+  update,
   upgrade,
   extraUsage,
   extraUsageNonInteractive,
@@ -324,8 +354,8 @@ const COMMANDS = memoize((): Command[] => [
   usage,
   usageReport,
   vim,
+  wiki,
   ...(webCmd ? [webCmd] : []),
-  ...(forkCmd ? [forkCmd] : []),
   ...(buddy ? [buddy] : []),
   ...(proactive ? [proactive] : []),
   ...(briefCommand ? [briefCommand] : []),
@@ -341,7 +371,7 @@ const COMMANDS = memoize((): Command[] => [
   hooks,
   exportCommand,
   sandboxToggle,
-  ...(!isUsing3PServices() ? [logout, login()] : []),
+  ...(!isUsing3PServices() ? [logout, login()].filter(Boolean) : []),
   passes,
   ...(peersCmd ? [peersCmd] : []),
   tasks,
@@ -350,7 +380,12 @@ const COMMANDS = memoize((): Command[] => [
   ...(process.env.USER_TYPE === 'ant' && !process.env.IS_DEMO
     ? INTERNAL_ONLY_COMMANDS
     : []),
-])
+].filter(isCommand).map(withOpenClaudeCommandLocalizationKey))
+
+function withOpenClaudeCommandLocalizationKey(cmd: Command): Command {
+  cmd.localizationKey ??= getOpenClaudeCommandDescriptionKey(cmd.name)
+  return cmd
+}
 
 export const builtInCommandNames = memoize(
   (): Set<string> =>
@@ -421,8 +456,8 @@ const getWorkflowCommands = feature('WORKFLOW_SCRIPTS')
  * Not memoized — auth state can change mid-session (e.g. after /login),
  * so this must be re-evaluated on every getCommands() call.
  */
-export function meetsAvailabilityRequirement(cmd: Command): boolean {
-  if (!cmd.availability) return true
+export function meetsAvailabilityRequirement(cmd: Command | null | undefined): boolean {
+  if (!cmd || !cmd.availability || !Array.isArray(cmd.availability)) return true
   for (const a of cmd.availability) {
     switch (a) {
       case 'claude-ai':
@@ -528,6 +563,8 @@ export async function getCommands(cwd: string): Promise<Command[]> {
  * Use this when dynamic skills are added to invalidate cached command lists.
  */
 export function clearCommandMemoizationCaches(): void {
+  COMMANDS.cache?.clear?.()
+  builtInCommandNames.cache?.clear?.()
   loadAllCommands.cache?.clear?.()
   getSkillToolCommands.cache?.clear?.()
   getSlashCommandToolSkills.cache?.clear?.()
@@ -629,13 +666,16 @@ export const REMOTE_SAFE_COMMANDS: Set<Command> = new Set([
   clear, // Clear screen
   help, // Show help
   theme, // Change terminal theme
+  logo, // Change startup logo color scheme
   color, // Change agent color
   vim, // Toggle vim mode
   cost, // Show session cost (local cost tracking)
+  ctx_viz, // Context window usage
   usage, // Show usage info
   copy, // Copy last message
   btw, // Quick note
   feedback, // Send feedback
+  goal, // Manage session goal continuation
   plan, // Plan mode toggle
   keybindings, // Keybinding management
   statusline, // Status line toggle
@@ -660,9 +700,11 @@ export const BRIDGE_SAFE_COMMANDS: Set<Command> = new Set(
     compact, // Shrink context — useful mid-session from a phone
     clear, // Wipe transcript
     cost, // Show session cost
+    ctx_viz, // Context window usage
     summary, // Summarize conversation
     releaseNotes, // Show changelog
     files, // List tracked files
+    goal, // Manage session goal continuation
   ].filter((c): c is Command => c !== null),
 )
 
@@ -734,28 +776,40 @@ export function getCommand(commandName: string, commands: Command[]): Command {
  */
 export function formatDescriptionWithSource(cmd: Command): string {
   if (cmd.type !== 'prompt') {
-    return cmd.description
+    return formatOpenClaudeOwnedDescription(cmd)
   }
 
+  const desc = cmd.description ?? ''
+
   if (cmd.kind === 'workflow') {
-    return `${cmd.description} (workflow)`
+    return `${desc} (workflow)`
   }
 
   if (cmd.source === 'plugin') {
     const pluginName = cmd.pluginInfo?.pluginManifest.name
     if (pluginName) {
-      return `(${pluginName}) ${cmd.description}`
+      return `(${pluginName}) ${desc}`
     }
-    return `${cmd.description} (plugin)`
+    return `${desc} (plugin)`
   }
 
   if (cmd.source === 'builtin' || cmd.source === 'mcp') {
-    return cmd.description
+    return cmd.source === 'builtin'
+      ? formatOpenClaudeOwnedDescription(cmd)
+      : desc
   }
 
   if (cmd.source === 'bundled') {
-    return `${cmd.description} (bundled)`
+    return `${formatOpenClaudeOwnedDescription(cmd)} (bundled)`
   }
 
-  return `${cmd.description} (${getSettingSourceName(cmd.source)})`
+  return `${desc} (${getSettingSourceName(cmd.source)})`
+}
+
+function formatOpenClaudeOwnedDescription(cmd: Command): string {
+  const desc = cmd.description ?? ''
+  if (cmd.localizationKey) {
+    return localize(cmd.localizationKey, desc)
+  }
+  return desc
 }

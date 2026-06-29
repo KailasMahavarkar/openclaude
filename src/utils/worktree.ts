@@ -192,6 +192,36 @@ type WorktreeCreateResult =
       existed: false
     }
 
+const gitWorktreeMutationLocks = new Map<string, Promise<void>>()
+
+export async function withGitWorktreeMutationLock<T>(
+  repoRoot: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = gitWorktreeMutationLocks.get(repoRoot) ?? Promise.resolve()
+  let releaseCurrent!: () => void
+  const current = new Promise<void>(resolve => {
+    releaseCurrent = resolve
+  })
+  const next = previous.catch(() => {}).then(() => current)
+  gitWorktreeMutationLocks.set(repoRoot, next)
+
+  await previous.catch(() => {})
+
+  try {
+    return await fn()
+  } finally {
+    releaseCurrent()
+    if (gitWorktreeMutationLocks.get(repoRoot) === next) {
+      gitWorktreeMutationLocks.delete(repoRoot)
+    }
+  }
+}
+
+export function _resetGitWorktreeMutationLocksForTesting(): void {
+  gitWorktreeMutationLocks.clear()
+}
+
 // Env vars to prevent git/SSH from prompting for credentials (which hangs the CLI).
 // GIT_TERMINAL_PROMPT=0 prevents git from opening /dev/tty for credential prompts.
 // GIT_ASKPASS='' disables askpass GUI programs.
@@ -222,6 +252,26 @@ export function worktreeBranchName(slug: string): string {
   return `worktree-${flattenSlug(slug)}`
 }
 
+/**
+ * Builds a human-readable message for `git rev-parse <baseBranch>` failures
+ * during worktree creation. Surfaces git's stderr so users can distinguish
+ * empty repos ("unknown revision or path"), detached HEADs pointing at
+ * missing objects, and a missing git binary — each previously surfaced as
+ * the same useless `git rev-parse failed`. See #690.
+ */
+export function buildRevParseFailureMessage(
+  baseBranch: string,
+  stderr: string,
+  exitCode: number,
+): string {
+  const detail = stderr.trim() || `exit code ${exitCode}`
+  const hint =
+    baseBranch === 'HEAD'
+      ? ' (HEAD has no resolvable commit — make at least one commit, or check whether git is installed and on PATH)'
+      : ''
+  return `Failed to resolve base branch "${baseBranch}": ${detail}${hint}`
+}
+
 function worktreePathFor(repoRoot: string, slug: string): string {
   return join(worktreesDir(repoRoot), flattenSlug(slug))
 }
@@ -235,7 +285,7 @@ function worktreePathFor(repoRoot: string, slug: string): string {
 async function getOrCreateWorktree(
   repoRoot: string,
   slug: string,
-  options?: { prNumber?: number },
+  options?: { prNumber?: number; baseRef?: string },
 ): Promise<WorktreeCreateResult> {
   const worktreePath = worktreePathFor(repoRoot, slug)
   const worktreeBranch = worktreeBranchName(slug)
@@ -254,124 +304,142 @@ async function getOrCreateWorktree(
     }
   }
 
-  // New worktree: fetch base branch then add
-  await mkdir(worktreesDir(repoRoot), { recursive: true })
-
-  const fetchEnv = { ...process.env, ...GIT_NO_PROMPT_ENV }
-
-  let baseBranch: string
-  let baseSha: string | null = null
-  if (options?.prNumber) {
-    const { code: prFetchCode, stderr: prFetchStderr } =
-      await execFileNoThrowWithCwd(
-        gitExe(),
-        ['fetch', 'origin', `pull/${options.prNumber}/head`],
-        { cwd: repoRoot, stdin: 'ignore', env: fetchEnv },
-      )
-    if (prFetchCode !== 0) {
-      throw new Error(
-        `Failed to fetch PR #${options.prNumber}: ${prFetchStderr.trim() || 'PR may not exist or the repository may not have a remote named "origin"'}`,
-      )
+  return withGitWorktreeMutationLock(repoRoot, async () => {
+    const lockedExistingHead = await readWorktreeHeadSha(worktreePath)
+    if (lockedExistingHead) {
+      return {
+        worktreePath,
+        worktreeBranch,
+        headCommit: lockedExistingHead,
+        existed: true,
+      }
     }
-    baseBranch = 'FETCH_HEAD'
-  } else {
-    // If origin/<branch> already exists locally, skip fetch. In large repos
-    // (210k files, 16M objects) fetch burns ~6-8s on a local commit-graph
-    // scan before even hitting the network. A slightly stale base is fine —
-    // the user can pull in the worktree if they want latest.
-    // resolveRef reads the loose/packed ref directly; when it succeeds we
-    // already have the SHA, so the later rev-parse is skipped entirely.
-    const [defaultBranch, gitDir] = await Promise.all([
-      getDefaultBranch(),
-      resolveGitDir(repoRoot),
-    ])
-    const originRef = `origin/${defaultBranch}`
-    const originSha = gitDir
-      ? await resolveRef(gitDir, `refs/remotes/origin/${defaultBranch}`)
-      : null
-    if (originSha) {
-      baseBranch = originRef
-      baseSha = originSha
+
+    // New worktree: fetch base branch then add
+    await mkdir(worktreesDir(repoRoot), { recursive: true })
+
+    const fetchEnv = { ...process.env, ...GIT_NO_PROMPT_ENV }
+
+    let baseBranch: string
+    let baseSha: string | null = null
+    if (options?.prNumber) {
+      const { code: prFetchCode, stderr: prFetchStderr } =
+        await execFileNoThrowWithCwd(
+          gitExe(),
+          ['fetch', 'origin', `pull/${options.prNumber}/head`],
+          { cwd: repoRoot, stdin: 'ignore', env: fetchEnv },
+        )
+      if (prFetchCode !== 0) {
+        throw new Error(
+          `Failed to fetch PR #${options.prNumber}: ${prFetchStderr.trim() || 'PR may not exist or the repository may not have a remote named "origin"'}`,
+        )
+      }
+      baseBranch = 'FETCH_HEAD'
+    } else if (options?.baseRef) {
+      // Caller pinned an explicit base (e.g. agent isolation passes the parent
+      // session's HEAD so the worktree mirrors the parent's committed state
+      // rather than origin/<defaultBranch>). Use it verbatim; the rev-parse
+      // below resolves it to a SHA.
+      baseBranch = options.baseRef
     } else {
-      const { code: fetchCode } = await execFileNoThrowWithCwd(
-        gitExe(),
-        ['fetch', 'origin', defaultBranch],
-        { cwd: repoRoot, stdin: 'ignore', env: fetchEnv },
-      )
-      baseBranch = fetchCode === 0 ? originRef : 'HEAD'
+      // If origin/<branch> already exists locally, skip fetch. In large repos
+      // (210k files, 16M objects) fetch burns ~6-8s on a local commit-graph
+      // scan before even hitting the network. A slightly stale base is fine —
+      // the user can pull in the worktree if they want latest.
+      // resolveRef reads the loose/packed ref directly; when it succeeds we
+      // already have the SHA, so the later rev-parse is skipped entirely.
+      const [defaultBranch, gitDir] = await Promise.all([
+        getDefaultBranch(),
+        resolveGitDir(repoRoot),
+      ])
+      const originRef = `origin/${defaultBranch}`
+      const originSha = gitDir
+        ? await resolveRef(gitDir, `refs/remotes/origin/${defaultBranch}`)
+        : null
+      if (originSha) {
+        baseBranch = originRef
+        baseSha = originSha
+      } else {
+        const { code: fetchCode } = await execFileNoThrowWithCwd(
+          gitExe(),
+          ['fetch', 'origin', defaultBranch],
+          { cwd: repoRoot, stdin: 'ignore', env: fetchEnv },
+        )
+        baseBranch = fetchCode === 0 ? originRef : 'HEAD'
+      }
     }
-  }
 
-  // For the fetch/PR-fetch paths we still need the SHA — the fs-only resolveRef
-  // above only covers the "origin/<branch> already exists locally" case.
-  if (!baseSha) {
-    const { stdout, code: shaCode } = await execFileNoThrowWithCwd(
-      gitExe(),
-      ['rev-parse', baseBranch],
-      { cwd: repoRoot },
-    )
-    if (shaCode !== 0) {
-      throw new Error(
-        `Failed to resolve base branch "${baseBranch}": git rev-parse failed`,
-      )
-    }
-    baseSha = stdout.trim()
-  }
-
-  const sparsePaths = getInitialSettings().worktree?.sparsePaths
-  const addArgs = ['worktree', 'add']
-  if (sparsePaths?.length) {
-    addArgs.push('--no-checkout')
-  }
-  // -B (not -b): reset any orphan branch left behind by a removed worktree dir.
-  // Saves a `git branch -D` subprocess (~15ms spawn overhead) on every create.
-  addArgs.push('-B', worktreeBranch, worktreePath, baseBranch)
-
-  const { code: createCode, stderr: createStderr } =
-    await execFileNoThrowWithCwd(gitExe(), addArgs, { cwd: repoRoot })
-  if (createCode !== 0) {
-    throw new Error(`Failed to create worktree: ${createStderr}`)
-  }
-
-  if (sparsePaths?.length) {
-    // If sparse-checkout or checkout fail after --no-checkout, the worktree
-    // is registered and HEAD is set but the working tree is empty. Next run's
-    // fast-resume (rev-parse HEAD) would succeed and present a broken worktree
-    // as "resumed". Tear it down before propagating the error.
-    const tearDown = async (msg: string): Promise<never> => {
-      await execFileNoThrowWithCwd(
+    // For the fetch/PR-fetch paths we still need the SHA — the fs-only resolveRef
+    // above only covers the "origin/<branch> already exists locally" case.
+    if (!baseSha) {
+      const { stdout, stderr, code: shaCode } = await execFileNoThrowWithCwd(
         gitExe(),
-        ['worktree', 'remove', '--force', worktreePath],
+        ['rev-parse', baseBranch],
         { cwd: repoRoot },
       )
-      throw new Error(msg)
+      if (shaCode !== 0) {
+        throw new Error(
+          buildRevParseFailureMessage(baseBranch, stderr, shaCode),
+        )
+      }
+      baseSha = stdout.trim()
     }
-    const { code: sparseCode, stderr: sparseErr } =
-      await execFileNoThrowWithCwd(
+
+    const sparsePaths = getInitialSettings().worktree?.sparsePaths
+    const addArgs = ['worktree', 'add']
+    if (sparsePaths?.length) {
+      addArgs.push('--no-checkout')
+    }
+    // -B (not -b): reset any orphan branch left behind by a removed worktree dir.
+    // Saves a `git branch -D` subprocess (~15ms spawn overhead) on every create.
+    addArgs.push('-B', worktreeBranch, worktreePath, baseBranch)
+
+    const { code: createCode, stderr: createStderr } =
+      await execFileNoThrowWithCwd(gitExe(), addArgs, { cwd: repoRoot })
+    if (createCode !== 0) {
+      throw new Error(`Failed to create worktree: ${createStderr}`)
+    }
+
+    if (sparsePaths?.length) {
+      // If sparse-checkout or checkout fail after --no-checkout, the worktree
+      // is registered and HEAD is set but the working tree is empty. Next run's
+      // fast-resume (rev-parse HEAD) would succeed and present a broken worktree
+      // as "resumed". Tear it down before propagating the error.
+      const tearDown = async (msg: string): Promise<never> => {
+        await execFileNoThrowWithCwd(
+          gitExe(),
+          ['worktree', 'remove', '--force', worktreePath],
+          { cwd: repoRoot },
+        )
+        throw new Error(msg)
+      }
+      const { code: sparseCode, stderr: sparseErr } =
+        await execFileNoThrowWithCwd(
+          gitExe(),
+          ['sparse-checkout', 'set', '--cone', '--', ...sparsePaths],
+          { cwd: worktreePath },
+        )
+      if (sparseCode !== 0) {
+        await tearDown(`Failed to configure sparse-checkout: ${sparseErr}`)
+      }
+      const { code: coCode, stderr: coErr } = await execFileNoThrowWithCwd(
         gitExe(),
-        ['sparse-checkout', 'set', '--cone', '--', ...sparsePaths],
+        ['checkout', 'HEAD'],
         { cwd: worktreePath },
       )
-    if (sparseCode !== 0) {
-      await tearDown(`Failed to configure sparse-checkout: ${sparseErr}`)
+      if (coCode !== 0) {
+        await tearDown(`Failed to checkout sparse worktree: ${coErr}`)
+      }
     }
-    const { code: coCode, stderr: coErr } = await execFileNoThrowWithCwd(
-      gitExe(),
-      ['checkout', 'HEAD'],
-      { cwd: worktreePath },
-    )
-    if (coCode !== 0) {
-      await tearDown(`Failed to checkout sparse worktree: ${coErr}`)
-    }
-  }
 
-  return {
-    worktreePath,
-    worktreeBranch,
-    headCommit: baseSha,
-    baseBranch,
-    existed: false,
-  }
+    return {
+      worktreePath,
+      worktreeBranch,
+      headCommit: baseSha,
+      baseBranch,
+      existed: false,
+    }
+  })
 }
 
 /**
@@ -899,7 +967,10 @@ export async function cleanupWorktree(): Promise<void> {
  * global session state (currentWorktreeSession, process.chdir, project config).
  * Falls back to hook-based creation if not in a git repository.
  */
-export async function createAgentWorktree(slug: string): Promise<{
+export async function createAgentWorktree(
+  slug: string,
+  options?: { cwd?: string },
+): Promise<{
   worktreePath: string
   worktreeBranch?: string
   headCommit?: string
@@ -907,6 +978,11 @@ export async function createAgentWorktree(slug: string): Promise<{
   hookBased?: boolean
 }> {
   validateWorktreeSlug(slug)
+
+  // Resolve the parent session's working directory once. Defaults to the
+  // ambient session cwd; callers (and tests) may pin it explicitly so both the
+  // canonical-root and parent-HEAD lookups below stay consistent.
+  const sessionCwd = options?.cwd ?? getCwd()
 
   // Try hook-based worktree creation first (allows user-configured VCS)
   if (hasWorktreeCreateHook()) {
@@ -923,7 +999,7 @@ export async function createAgentWorktree(slug: string): Promise<{
   // the main repo's .claude/worktrees/ even when spawned from inside a session
   // worktree — otherwise they nest at <worktree>/.claude/worktrees/ and the
   // periodic cleanup (which scans the canonical root) never finds them.
-  const gitRoot = findCanonicalGitRoot(getCwd())
+  const gitRoot = findCanonicalGitRoot(sessionCwd)
   if (!gitRoot) {
     throw new Error(
       'Cannot create agent worktree: not in a git repository and no WorktreeCreate hooks are configured. ' +
@@ -931,8 +1007,26 @@ export async function createAgentWorktree(slug: string): Promise<{
     )
   }
 
+  // Base the agent worktree on the parent session's current HEAD so the
+  // isolated agent sees the same committed project state the parent is working
+  // on — not origin/<defaultBranch>, which may be an older tree missing files
+  // that only exist on the active branch (#1586). Resolve from the session cwd
+  // (not the canonical root) so a session on a feature branch is honored. Fall
+  // back to the default origin-based behavior if HEAD can't be resolved (e.g. a
+  // repo with no commits yet).
+  const { stdout: headStdout, code: headCode } =
+    await execFileNoThrowWithCwd(gitExe(), ['rev-parse', 'HEAD'], {
+      cwd: sessionCwd,
+    })
+  const parentHeadRef =
+    headCode === 0 && headStdout.trim() ? headStdout.trim() : undefined
+
   const { worktreePath, worktreeBranch, headCommit, existed } =
-    await getOrCreateWorktree(gitRoot, slug)
+    await getOrCreateWorktree(
+      gitRoot,
+      slug,
+      parentHeadRef ? { baseRef: parentHeadRef } : undefined,
+    )
 
   if (!existed) {
     logForDebugging(
@@ -984,39 +1078,41 @@ export async function removeAgentWorktree(
     return false
   }
 
-  // Run from the main repo root, not the worktree (which we're about to delete)
-  const { code: removeCode, stderr: removeError } =
-    await execFileNoThrowWithCwd(
-      gitExe(),
-      ['worktree', 'remove', '--force', worktreePath],
-      { cwd: gitRoot },
-    )
+  return withGitWorktreeMutationLock(gitRoot, async () => {
+    // Run from the main repo root, not the worktree (which we're about to delete)
+    const { code: removeCode, stderr: removeError } =
+      await execFileNoThrowWithCwd(
+        gitExe(),
+        ['worktree', 'remove', '--force', worktreePath],
+        { cwd: gitRoot },
+      )
 
-  if (removeCode !== 0) {
-    logForDebugging(`Failed to remove agent worktree: ${removeError}`, {
-      level: 'error',
-    })
-    return false
-  }
-  logForDebugging(`Removed agent worktree at: ${worktreePath}`)
+    if (removeCode !== 0) {
+      logForDebugging(`Failed to remove agent worktree: ${removeError}`, {
+        level: 'error',
+      })
+      return false
+    }
+    logForDebugging(`Removed agent worktree at: ${worktreePath}`)
 
-  if (!worktreeBranch) {
+    if (!worktreeBranch) {
+      return true
+    }
+
+    // Delete the temporary worktree branch from the main repo
+    const { code: deleteBranchCode, stderr: deleteBranchError } =
+      await execFileNoThrowWithCwd(gitExe(), ['branch', '-D', worktreeBranch], {
+        cwd: gitRoot,
+      })
+
+    if (deleteBranchCode !== 0) {
+      logForDebugging(
+        `Could not delete agent worktree branch: ${deleteBranchError}`,
+        { level: 'error' },
+      )
+    }
     return true
-  }
-
-  // Delete the temporary worktree branch from the main repo
-  const { code: deleteBranchCode, stderr: deleteBranchError } =
-    await execFileNoThrowWithCwd(gitExe(), ['branch', '-D', worktreeBranch], {
-      cwd: gitRoot,
-    })
-
-  if (deleteBranchCode !== 0) {
-    logForDebugging(
-      `Could not delete agent worktree branch: ${deleteBranchError}`,
-      { level: 'error' },
-    )
-  }
-  return true
+  })
 }
 
 /**
@@ -1268,8 +1364,7 @@ export async function execIntoTmuxWorktree(args: string[]): Promise<{
       }
     }
     repoName = basename(findCanonicalGitRoot(getCwd()) ?? getCwd())
-    // biome-ignore lint/suspicious/noConsole: intentional console output
-    console.log(`Using worktree via hook: ${worktreeDir}`)
+    logForDebugging(`Using worktree via hook: ${worktreeDir}`)
   } else {
     // Get main git repo root (resolves through worktrees)
     const repoRoot = findCanonicalGitRoot(getCwd())
@@ -1291,8 +1386,7 @@ export async function execIntoTmuxWorktree(args: string[]): Promise<{
         prNumber !== null ? { prNumber } : undefined,
       )
       if (!result.existed) {
-        // biome-ignore lint/suspicious/noConsole: intentional console output
-        console.log(
+        logForDebugging(
           `Created worktree: ${worktreeDir} (based on ${result.baseBranch})`,
         )
         await performPostCreationSetup(repoRoot, worktreeDir)

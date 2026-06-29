@@ -2,7 +2,7 @@ import type { UUID } from 'crypto'
 import { logEvent } from 'src/services/analytics/index.js'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from 'src/services/analytics/metadata.js'
 import { type Command, getCommandName, isCommandEnabled } from '../commands.js'
-import { selectableUserMessagesFilter } from '../components/MessageSelector.js'
+import { selectableUserMessagesFilter } from './messageFilters.js'
 import type { SpinnerMode } from '../components/Spinner/types.js'
 import type { QuerySource } from '../constants/querySource.js'
 import { expandPastedTextRefs, parseReferences } from '../history.js'
@@ -115,6 +115,7 @@ export type HandlePromptSubmitParams = BaseExecutionParams & {
    * trigger local slash commands or skills.
    */
   skipSlashCommands?: boolean
+  slashCommandOverride?: Command
 }
 
 export async function handlePromptSubmit(
@@ -141,6 +142,7 @@ export async function handlePromptSubmit(
     queuedCommands,
     uuid,
     skipSlashCommands,
+    slashCommandOverride,
   } = params
 
   const { setCursorOffset, clearBuffer, resetHistory } = helpers
@@ -340,6 +342,7 @@ export async function handlePromptSubmit(
       mode,
       pastedContents: hasImages ? pastedContents : undefined,
       skipSlashCommands,
+      slashCommandOverride,
       uuid,
     })
 
@@ -363,6 +366,7 @@ export async function handlePromptSubmit(
     mode,
     pastedContents: hasImages ? pastedContents : undefined,
     skipSlashCommands,
+    slashCommandOverride,
     uuid,
   }
 
@@ -491,6 +495,7 @@ async function executeUserInput(params: ExecuteUserInputParams): Promise<void> {
           uuid: cmd.uuid,
           ideSelection: isFirst ? ideSelection : undefined,
           skipSlashCommands: cmd.skipSlashCommands,
+          slashCommandOverride: cmd.slashCommandOverride,
           bridgeOrigin: cmd.bridgeOrigin,
           isMeta: cmd.isMeta,
           skipAttachments: !isFirst,

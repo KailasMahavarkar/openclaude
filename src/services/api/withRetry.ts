@@ -22,6 +22,7 @@ import {
   isEnterpriseSubscriber,
 } from '../../utils/auth.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
+import { validateBoundedIntEnvVar } from '../../utils/envValidation.js'
 import { errorMessage } from '../../utils/errors.js'
 import {
   type CooldownReason,
@@ -46,13 +47,20 @@ import {
 } from '../rateLimitMocking.js'
 import { REPEATED_529_ERROR_MESSAGE } from './errors.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
+import {
+  extractOpenAICategoryMarker,
+  isRetryableOpenAICompatibilityFailureCategory,
+} from './openaiErrorClassification.js'
 
 const abortError = () => new APIUserAbortError()
 
 const DEFAULT_MAX_RETRIES = 10
+const MAX_CONFIGURABLE_RETRIES = 100
 const FLOOR_OUTPUT_TOKENS = 3000
 const MAX_529_RETRIES = 3
-export const BASE_DELAY_MS = 500
+export const DEFAULT_RETRY_DELAY_MS = 500
+export const BASE_DELAY_MS = DEFAULT_RETRY_DELAY_MS
+const MAX_RETRY_DELAY_BASE_MS = 60_000
 
 // Foreground query sources where the user IS blocking on the result — these
 // retry on 529. Everything else (summaries, titles, suggestions, classifiers)
@@ -96,6 +104,12 @@ function shouldRetry529(querySource: QuerySource | undefined): boolean {
 const PERSISTENT_MAX_BACKOFF_MS = 5 * 60 * 1000
 const PERSISTENT_RESET_CAP_MS = 6 * 60 * 60 * 1000
 const HEARTBEAT_INTERVAL_MS = 30_000
+const PERSISTENT_MAX_ATTEMPTS = 100
+// Exposed for unit-test assertion only. The persistent retry cap itself is
+// driven by isPersistentRetryEnabled() — there is no runtime override seam
+// (tests must enable UNATTENDED_RETRY via `bun test --feature=UNATTENDED_RETRY`
+// and set CLAUDE_CODE_UNATTENDED_RETRY to exercise this path).
+export { PERSISTENT_MAX_ATTEMPTS as _PERSISTENT_MAX_ATTEMPTS_FOR_TEST, isPersistentRetryEnabled }
 
 function isPersistentRetryEnabled(): boolean {
   return feature('UNATTENDED_RETRY')
@@ -186,6 +200,7 @@ export async function* withRetry<T>(
   options: RetryOptions,
 ): AsyncGenerator<SystemAPIErrorMessage, T> {
   const maxRetries = getMaxRetries(options)
+  const persistentRetryEnabled = isPersistentRetryEnabled()
   const retryContext: RetryContext = {
     model: options.model,
     thinkingConfig: options.thinkingConfig,
@@ -285,7 +300,7 @@ export async function* withRetry<T>(
       // keep-alive path instead of fast-mode cache-preservation anyway.
       if (
         wasFastModeActive &&
-        !isPersistentRetryEnabled() &&
+        !persistentRetryEnabled &&
         error instanceof APIError &&
         (error.status === 429 || is529Error(error))
       ) {
@@ -372,7 +387,7 @@ export async function* withRetry<T>(
           if (
             process.env.USER_TYPE === 'external' &&
             !process.env.IS_SANDBOX &&
-            !isPersistentRetryEnabled()
+            !persistentRetryEnabled
           ) {
             logEvent('tengu_api_custom_529_overloaded_error', {})
             throw new CannotRetryError(
@@ -385,8 +400,24 @@ export async function* withRetry<T>(
 
       // Only retry if the error indicates we should
       const persistent =
-        isPersistentRetryEnabled() && isTransientCapacityError(error)
+        persistentRetryEnabled && isTransientCapacityError(error)
       if (attempt > maxRetries && !persistent) {
+        throw new CannotRetryError(error, retryContext)
+      }
+      // Cap persistent retries to prevent unbounded loops (100 attempts * ~5min max backoff = 8 hours).
+      // NOTE: the "~8 hours" estimate applies only to the exponential-backoff path. The
+      // reset-delay path can wait up to PERSISTENT_RESET_CAP_MS (6 hours) per attempt, so
+      // exhausting 100 attempts can take far longer.
+      if (persistent && persistentAttempt >= PERSISTENT_MAX_ATTEMPTS) {
+        logEvent('tengu_api_persistent_retry_cap_reached', {
+          error: (error as APIError).message as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          status: (error as APIError).status,
+          model: retryContext.model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          persistentAttempt,
+          PERSISTENT_MAX_BACKOFF_MS,
+          PERSISTENT_MAX_ATTEMPTS,
+          provider: getAPIProviderForStatsig(),
+        })
         throw new CannotRetryError(error, retryContext)
       }
 
@@ -395,9 +426,36 @@ export async function* withRetry<T>(
         handleAwsCredentialError(error) || handleGcpCredentialError(error)
       if (
         !handledCloudAuthError &&
-        (!(error instanceof APIError) || !shouldRetry(error))
+        (!(error instanceof APIError) ||
+          !shouldRetry(error, persistentRetryEnabled))
       ) {
         throw new CannotRetryError(error, retryContext)
+      }
+
+      // OpenRouter / OpenAI-compatible quota gateways: HTTP 402 with the
+      // affordable max_tokens in the message. Retry once at the affordable
+      // cap instead of failing on a credits-vs-max_tokens mismatch the user
+      // can't see in their shell (#1125). One adjustment per chain — if 402
+      // recurs after this, fail instead of spending the normal retry budget.
+      if (error instanceof APIError) {
+        const affordData = parseOpenRouterAffordableMaxTokensError(error)
+        if (affordData && retryContext.maxTokensOverride === undefined) {
+          retryContext.maxTokensOverride = affordData.affordableMaxTokens
+          logEvent('tengu_openrouter_402_max_tokens_adjustment', {
+            requestedMaxTokens: affordData.requestedMaxTokens,
+            affordableMaxTokens: affordData.affordableMaxTokens,
+            attempt,
+          })
+          // Surface the credit pressure so the user understands why output
+          // shrank. Single line; the provider already explained the why.
+          console.error(
+            `Provider returned 402 — retrying with max_tokens=${affordData.affordableMaxTokens} (was ${affordData.requestedMaxTokens}). Top up credits to restore the full budget.`,
+          )
+          continue
+        }
+        if (affordData) {
+          throw new CannotRetryError(error, retryContext)
+        }
       }
 
       // Handle max tokens context overflow errors by adjusting max_tokens for the next attempt
@@ -558,12 +616,48 @@ export function getRetryDelay(
     }
   }
 
+  const baseDelayMs = getDefaultRetryDelayMs()
   const baseDelay = Math.min(
-    BASE_DELAY_MS * Math.pow(2, attempt - 1),
+    baseDelayMs * Math.pow(2, attempt - 1),
     maxDelayMs,
   )
   const jitter = Math.random() * 0.25 * baseDelay
   return baseDelay + jitter
+}
+
+/**
+ * OpenRouter (and several other quota-billed gateways) reply with HTTP 402
+ * when the caller has fewer credits than the requested max_tokens would
+ * consume. The error message includes the affordable cap, so we can retry
+ * once with the lower number instead of forcing the user to manually lower
+ * their max_tokens (issue #1125).
+ *
+ * Example body:
+ *   This request requires more credits, or fewer max_tokens. You requested
+ *   up to 32000 tokens, but can only afford 27342. To increase, visit ...
+ */
+export function parseOpenRouterAffordableMaxTokensError(error: APIError):
+  | { requestedMaxTokens: number; affordableMaxTokens: number }
+  | undefined {
+  if (error.status !== 402 || !error.message) {
+    return undefined
+  }
+  const regex =
+    /requested up to (\d+) tokens?, but can only afford (\d+)/i
+  const match = error.message.match(regex)
+  if (!match || match.length !== 3 || !match[1] || !match[2]) {
+    return undefined
+  }
+  const requestedMaxTokens = parseInt(match[1], 10)
+  const affordableMaxTokens = parseInt(match[2], 10)
+  if (
+    isNaN(requestedMaxTokens) ||
+    isNaN(affordableMaxTokens) ||
+    affordableMaxTokens <= 0
+  ) {
+    return undefined
+  }
+  return { requestedMaxTokens, affordableMaxTokens }
 }
 
 export function parseMaxTokensContextOverflowError(error: APIError):
@@ -712,7 +806,7 @@ function handleGcpCredentialError(error: unknown): boolean {
   return false
 }
 
-function shouldRetry(error: APIError): boolean {
+function shouldRetry(error: APIError, persistentRetryEnabled: boolean): boolean {
   // Never retry mock errors - they're from /mock-limits command for testing
   if (isMockRateLimitError(error)) {
     return false
@@ -720,8 +814,27 @@ function shouldRetry(error: APIError): boolean {
 
   // Persistent mode: 429/529 always retryable, bypass subscriber gates and
   // x-should-retry header.
-  if (isPersistentRetryEnabled() && isTransientCapacityError(error)) {
+  if (persistentRetryEnabled && isTransientCapacityError(error)) {
     return true
+  }
+
+  // Local max_tokens recovery paths need to run even when an
+  // OpenAI-compatible shim classifies the underlying provider error as a
+  // non-retryable context or quota failure.
+  if (parseMaxTokensContextOverflowError(error)) {
+    return true
+  }
+
+  if (parseOpenRouterAffordableMaxTokensError(error)) {
+    return true
+  }
+
+  const openAICategory = extractOpenAICategoryMarker(error.message ?? '')
+  if (
+    openAICategory &&
+    !isRetryableOpenAICompatibilityFailureCategory(openAICategory)
+  ) {
+    return false
   }
 
   // CCR mode: auth is via infrastructure-provided JWTs, so a 401/403 is a
@@ -739,11 +852,6 @@ function shouldRetry(error: APIError): boolean {
   // The SDK sometimes fails to properly pass the 529 status code during streaming,
   // so we need to check the error message directly
   if (error.message?.includes('"type":"overloaded_error"')) {
-    return true
-  }
-
-  // Check for max tokens context overflow errors that we can handle
-  if (parseMaxTokensContextOverflowError(error)) {
     return true
   }
 
@@ -807,13 +915,61 @@ function shouldRetry(error: APIError): boolean {
 }
 
 export function getDefaultMaxRetries(): number {
-  if (process.env.CLAUDE_CODE_MAX_RETRIES) {
-    return parseInt(process.env.CLAUDE_CODE_MAX_RETRIES, 10)
+  const openClaudeMaxRetries = process.env.OPENCLAUDE_MAX_RETRIES
+  if (openClaudeMaxRetries) {
+    return validateRetryAttemptsEnvVar(
+      'OPENCLAUDE_MAX_RETRIES',
+      openClaudeMaxRetries,
+    )
   }
+
+  const legacyMaxRetries = process.env.CLAUDE_CODE_MAX_RETRIES
+  if (legacyMaxRetries) {
+    logForDebugging(
+      'CLAUDE_CODE_MAX_RETRIES is deprecated; use OPENCLAUDE_MAX_RETRIES instead',
+    )
+    return validateRetryAttemptsEnvVar(
+      'CLAUDE_CODE_MAX_RETRIES',
+      legacyMaxRetries,
+    )
+  }
+
   return DEFAULT_MAX_RETRIES
+}
+
+export function getDefaultRetryDelayMs(): number {
+  return validateBoundedIntEnvVar(
+    'OPENCLAUDE_RETRY_DELAY_MS',
+    process.env.OPENCLAUDE_RETRY_DELAY_MS,
+    DEFAULT_RETRY_DELAY_MS,
+    MAX_RETRY_DELAY_BASE_MS,
+  ).effective
 }
 function getMaxRetries(options: RetryOptions): number {
   return options.maxRetries ?? getDefaultMaxRetries()
+}
+
+function validateRetryAttemptsEnvVar(
+  envVarName: string,
+  value: string | undefined,
+): number {
+  if (!value) {
+    return DEFAULT_MAX_RETRIES
+  }
+  const parsed = parseInt(value, 10)
+  if (isNaN(parsed) || parsed < 0) {
+    logForDebugging(
+      `${envVarName} Invalid value "${value}" (using default: ${DEFAULT_MAX_RETRIES})`,
+    )
+    return DEFAULT_MAX_RETRIES
+  }
+  if (parsed > MAX_CONFIGURABLE_RETRIES) {
+    logForDebugging(
+      `${envVarName} Capped from ${parsed} to ${MAX_CONFIGURABLE_RETRIES}`,
+    )
+    return MAX_CONFIGURABLE_RETRIES
+  }
+  return parsed
 }
 
 const DEFAULT_FAST_MODE_FALLBACK_HOLD_MS = 30 * 60 * 1000 // 30 minutes

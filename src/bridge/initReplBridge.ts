@@ -30,6 +30,7 @@ import {
   getClaudeAIOAuthTokens,
   handleOAuth401Error,
 } from '../utils/auth.js'
+import { createCombinedAbortSignal } from '../utils/combinedAbortSignal.js'
 import { getGlobalConfig, saveGlobalConfig } from '../utils/config.js'
 import { logForDebugging } from '../utils/debug.js'
 import { stripDisplayTagsAllowEmpty } from '../utils/displayTags.js'
@@ -46,6 +47,7 @@ import { getCurrentSessionTitle } from '../utils/sessionStorage.js'
 import {
   extractConversationText,
   generateSessionTitle,
+  titleOrNullForPromptFallback,
 } from '../utils/sessionTitle.js'
 import { generateShortWordSlug } from '../utils/words.js'
 import {
@@ -80,7 +82,10 @@ export type InitBridgeOptions = {
   onSetMaxThinkingTokens?: (maxTokens: number | null) => void
   onSetPermissionMode?: (
     mode: PermissionMode,
-  ) => { ok: true } | { ok: false; error: string }
+  ) =>
+    | { ok: true }
+    | { ok: false; error: string }
+    | Promise<{ ok: true } | { ok: false; error: string }>
   onStateChange?: (state: BridgeState, detail?: string) => void
   initialMessages?: Message[]
   // Explicit session name from `/remote-control <name>`. When set, overrides
@@ -333,18 +338,22 @@ export async function initReplBridge(
   const generateAndPatch = (input: string, bridgeSessionId: string): void => {
     const gen = ++genSeq
     const atCount = userMessageCount
-    void generateSessionTitle(input, AbortSignal.timeout(15_000)).then(
-      generated => {
+    const { signal, cleanup } = createCombinedAbortSignal(undefined, {
+      timeoutMs: 15_000,
+    })
+    void generateSessionTitle(input, signal)
+      .then(generated => {
+        const titleToPatch = titleOrNullForPromptFallback(generated)
         if (
-          generated &&
+          titleToPatch &&
           gen === genSeq &&
           lastBridgeSessionId === bridgeSessionId &&
           !getCurrentSessionTitle(getSessionId())
         ) {
-          patch(generated, bridgeSessionId, atCount)
+          patch(titleToPatch, bridgeSessionId, atCount)
         }
-      },
-    )
+      })
+      .finally(cleanup)
   }
   const onUserMessage = (text: string, bridgeSessionId: string): boolean => {
     if (hasExplicitTitle || getCurrentSessionTitle(getSessionId())) {
@@ -377,10 +386,11 @@ export async function initReplBridge(
     return userMessageCount >= 3
   }
 
+  // Note: the open-source flag shim resolves from the local feature-flags
+  // file and takes no refresh-window argument.
   const initialHistoryCap = getFeatureValue_CACHED_WITH_REFRESH(
     'tengu_bridge_initial_history_cap',
     200,
-    5 * 60 * 1000,
   )
 
   // Fetch orgUUID before the v1/v2 branch — both paths need it. v1 for
@@ -415,7 +425,7 @@ export async function initReplBridge(
         `[bridge:repl] Skipping: ${versionError}`,
         true,
       )
-      onStateChange?.('failed', 'run `claude update` to upgrade')
+      onStateChange?.('failed', 'run `openclaude update` to upgrade')
       return null
     }
     logForDebugging(
@@ -456,7 +466,7 @@ export async function initReplBridge(
   const versionError = checkBridgeMinVersion()
   if (versionError) {
     logBridgeSkip('version_too_old', `[bridge:repl] Skipping: ${versionError}`)
-    onStateChange?.('failed', 'run `claude update` to upgrade')
+    onStateChange?.('failed', 'run `openclaude update` to upgrade')
     return null
   }
 
@@ -465,10 +475,7 @@ export async function initReplBridge(
   const branch = await getBranch()
   const gitRepoUrl = await getRemoteUrl()
   const sessionIngressUrl =
-    process.env.USER_TYPE === 'ant' &&
-    process.env.CLAUDE_BRIDGE_SESSION_INGRESS_URL
-      ? process.env.CLAUDE_BRIDGE_SESSION_INGRESS_URL
-      : baseUrl
+    process.env.CLAUDE_BRIDGE_SESSION_INGRESS_URL || baseUrl
 
   // Assistant-mode sessions advertise a distinct worker_type so the web UI
   // can filter them into a dedicated picker. KAIROS guard keeps the

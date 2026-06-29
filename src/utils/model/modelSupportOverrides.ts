@@ -4,6 +4,7 @@ import { getAPIProvider } from './providers.js'
 export type ModelCapabilityOverride =
   | 'effort'
   | 'max_effort'
+  | 'xhigh_effort'
   | 'thinking'
   | 'adaptive_thinking'
   | 'interleaved_thinking'
@@ -22,6 +23,23 @@ const TIERS = [
     capabilitiesEnvVar: 'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
   },
 ] as const
+
+function buildCapabilityOverrideCacheKey(
+  model: string,
+  capability: ModelCapabilityOverride,
+): string {
+  const envParts = TIERS.flatMap(tier => [
+    process.env[tier.modelEnvVar] ?? '',
+    process.env[tier.capabilitiesEnvVar] ?? '',
+  ])
+
+  return [
+    model.toLowerCase(),
+    capability,
+    getAPIProvider(),
+    ...envParts,
+  ].join('\0')
+}
 
 /**
  * Check whether a 3p model capability override is set for a model that matches one of
@@ -46,5 +64,5 @@ export const get3PModelCapabilityOverride = memoize(
     }
     return undefined
   },
-  (model, capability) => `${model.toLowerCase()}:${capability}`,
+  buildCapabilityOverrideCacheKey,
 )

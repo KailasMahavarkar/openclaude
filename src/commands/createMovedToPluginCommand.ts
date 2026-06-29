@@ -8,6 +8,7 @@ type Options = {
   progressMessage: string
   pluginName: string
   pluginCommand: string
+  allowedTools?: string[]
   /**
    * The prompt to use while the marketplace is private.
    * External users will get this prompt. Once the marketplace is public,
@@ -25,6 +26,7 @@ export function createMovedToPluginCommand({
   progressMessage,
   pluginName,
   pluginCommand,
+  allowedTools,
   getPromptWhileMarketplaceIsPrivate,
 }: Options): Command {
   return {
@@ -37,6 +39,12 @@ export function createMovedToPluginCommand({
       return name
     },
     source: 'builtin',
+    get allowedTools() {
+      // The ant branch only returns a plugin-install notice that doesn't
+      // need any tools — avoid granting turn-scoped permissions for it.
+      if (process.env.USER_TYPE === 'ant') return undefined
+      return allowedTools
+    },
     async getPromptForCommand(
       args: string,
       context: ToolUseContext,
@@ -48,7 +56,7 @@ export function createMovedToPluginCommand({
             text: `This command has been moved to a plugin. Tell the user:
 
 1. To install the plugin, run:
-   claude plugin install ${pluginName}@claude-code-marketplace
+   openclaude plugin install ${pluginName}@claude-code-marketplace
 
 2. After installation, use /${pluginName}:${pluginCommand} to run this command
 

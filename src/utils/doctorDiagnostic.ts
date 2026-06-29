@@ -11,10 +11,11 @@ import {
   type InstallMethod,
 } from './config.js'
 import { getCwd } from './cwd.js'
-import { isEnvTruthy } from './envUtils.js'
+import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 import { execFileNoThrow } from './execFileNoThrow.js'
 import { getFsImplementation } from './fsOperations.js'
 import {
+  getDetectedLocalInstallDir,
   getShellType,
   isRunningFromLocalInstallation,
   localInstallationExists,
@@ -34,6 +35,10 @@ import { getPlatform } from './platform.js'
 import { getRipgrepStatus } from './ripgrep.js'
 import { SandboxManager } from './sandbox/sandbox-adapter.js'
 import { getManagedFilePath } from './settings/managedPath.js'
+import {
+  getRelativeSettingsFilePathForSource,
+  getSettingsRootPathForSource,
+} from './settings/settings.js'
 import { CUSTOMIZATION_SURFACES } from './settings/types.js'
 import {
   findClaudeAlias,
@@ -42,6 +47,16 @@ import {
 } from './shellConfig.js'
 import { jsonParse } from './slowOperations.js'
 import { which } from './which.js'
+
+function getCliBinaryName(): string {
+  return MACRO.PACKAGE_URL === '@anthropic-ai/claude-code'
+    ? 'claude'
+    : 'openclaude'
+}
+
+function getNativeDataDirName(): string {
+  return getCliBinaryName()
+}
 
 export type InstallationType =
   | 'npm-global'
@@ -84,10 +99,6 @@ function getNormalizedPaths(): [invokedPath: string, execPath: string] {
 }
 
 export async function getCurrentInstallationType(): Promise<InstallationType> {
-  if (process.env.NODE_ENV === 'development') {
-    return 'development'
-  }
-
   const [invokedPath] = getNormalizedPaths()
 
   // Check if running in bundled mode first
@@ -143,6 +154,15 @@ export async function getCurrentInstallationType(): Promise<InstallationType> {
     return 'npm-global'
   }
 
+  // Development build: running from a source tree (e.g. `bun run dev`) with
+  // NODE_ENV=development. Checked AFTER all real-install path markers so that
+  // a user shell exporting NODE_ENV=development can't downgrade a real npm
+  // install to 'development' (which would block /update). A source-tree run
+  // matches none of the path markers above, so it lands here.
+  if (process.env.NODE_ENV === 'development') {
+    return 'development'
+  }
+
   // If we can't determine, return unknown
   return 'unknown'
 }
@@ -162,7 +182,7 @@ async function getInstallationPath(): Promise<string> {
     }
 
     try {
-      const path = await which('claude')
+      const path = await which(getCliBinaryName())
       if (path) {
         return path
       }
@@ -172,8 +192,14 @@ async function getInstallationPath(): Promise<string> {
 
     // If we can't find it, check common locations
     try {
-      await getFsImplementation().stat(join(homedir(), '.local/bin/claude'))
-      return join(homedir(), '.local/bin/claude')
+      const nativeBinaryPath = join(
+        homedir(),
+        '.local',
+        'bin',
+        getCliBinaryName(),
+      )
+      await getFsImplementation().stat(nativeBinaryPath)
+      return nativeBinaryPath
     } catch {
       // Not found
     }
@@ -209,8 +235,8 @@ async function detectMultipleInstallations(): Promise<
   const installations: Array<{ type: string; path: string }> = []
 
   // Check for local installation
-  const localPath = join(homedir(), '.claude', 'local')
-  if (await localInstallationExists()) {
+  const localPath = await getDetectedLocalInstallDir()
+  if (localPath) {
     installations.push({ type: 'npm-local', path: localPath })
   }
 
@@ -233,8 +259,8 @@ async function detectMultipleInstallations(): Promise<
     // Linux / macOS have prefix/bin/claude and prefix/lib/node_modules
     // Windows has prefix/claude and prefix/node_modules
     const globalBinPath = isWindows
-      ? join(npmPrefix, 'claude')
-      : join(npmPrefix, 'bin', 'claude')
+      ? join(npmPrefix, getCliBinaryName())
+      : join(npmPrefix, 'bin', getCliBinaryName())
 
     let globalBinExists = false
     try {
@@ -289,7 +315,7 @@ async function detectMultipleInstallations(): Promise<
   // Check for native installation
 
   // Check common native installation paths
-  const nativeBinPath = join(homedir(), '.local', 'bin', 'claude')
+  const nativeBinPath = join(homedir(), '.local', 'bin', getCliBinaryName())
   try {
     await fs.stat(nativeBinPath)
     installations.push({ type: 'native', path: nativeBinPath })
@@ -300,7 +326,12 @@ async function detectMultipleInstallations(): Promise<
   // Also check if config indicates native installation
   const config = getGlobalConfig()
   if (config.installMethod === 'native') {
-    const nativeDataPath = join(homedir(), '.local', 'share', 'claude')
+    const nativeDataPath = join(
+      homedir(),
+      '.local',
+      'share',
+      getNativeDataDirName(),
+    )
     try {
       await fs.stat(nativeDataPath)
       if (!installations.some(i => i.type === 'native')) {
@@ -314,10 +345,59 @@ async function detectMultipleInstallations(): Promise<
   return installations
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await getFsImplementation().stat(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export async function detectStaleProjectSettingsPaths(
+  cwd: string = getSettingsRootPathForSource('projectSettings'),
+): Promise<{ issue: string; fix: string } | null> {
+  const pairs = [
+    {
+      legacy: '.claude/settings.json',
+      canonical: getRelativeSettingsFilePathForSource('projectSettings'),
+    },
+    {
+      legacy: '.claude/settings.local.json',
+      canonical: getRelativeSettingsFilePathForSource('localSettings'),
+    },
+  ]
+
+  const stale: Array<{ legacy: string; canonical: string }> = []
+  for (const pair of pairs) {
+    const legacyExists = await pathExists(join(cwd, pair.legacy))
+    if (!legacyExists) continue
+    const canonicalExists = await pathExists(join(cwd, pair.canonical))
+    if (!canonicalExists) {
+      stale.push(pair)
+    }
+  }
+
+  if (stale.length === 0) return null
+
+  const legacyPaths = stale.map(pair => pair.legacy).join(', ')
+  const canonicalPaths = stale.map(pair => pair.canonical).join(', ')
+
+  return {
+    issue: `Legacy project settings file${stale.length === 1 ? '' : 's'} ${legacyPaths} found, but OpenClaude reads ${canonicalPaths}`,
+    fix: `Move or copy ${legacyPaths} to ${canonicalPaths} if you intended OpenClaude to use those project settings.`,
+  }
+}
+
 async function detectConfigurationIssues(
   type: InstallationType,
 ): Promise<Array<{ issue: string; fix: string }>> {
   const warnings: Array<{ issue: string; fix: string }> = []
+
+  const staleProjectSettingsWarning = await detectStaleProjectSettingsPaths()
+  if (staleProjectSettingsWarning) {
+    warnings.push(staleProjectSettingsWarning)
+  }
 
   // Managed-settings forwards-compat: the schema preprocess silently drops
   // unknown strictPluginOnlyCustomization surface names so one future enum
@@ -435,14 +515,14 @@ async function detectConfigurationIssues(
     if (type === 'npm-local' && config.installMethod !== 'local') {
       warnings.push({
         issue: `Running from local installation but config install method is '${config.installMethod}'`,
-        fix: 'Consider using native installation: claude install',
+        fix: `Consider using native installation: ${getCliBinaryName()} install`,
       })
     }
 
     if (type === 'native' && config.installMethod !== 'native') {
       warnings.push({
         issue: `Running native installation but config install method is '${config.installMethod}'`,
-        fix: 'Run claude install to update configuration',
+        fix: `Run ${getCliBinaryName()} install to update configuration`,
       })
     }
   }
@@ -450,7 +530,7 @@ async function detectConfigurationIssues(
   if (type === 'npm-global' && (await localInstallationExists())) {
     warnings.push({
       issue: 'Local installation exists but not being used',
-      fix: 'Consider using native installation: claude install',
+      fix: `Consider using native installation: ${getCliBinaryName()} install`,
     })
   }
 
@@ -460,7 +540,7 @@ async function detectConfigurationIssues(
   // Check if running local installation but it's not in PATH
   if (type === 'npm-local') {
     // Check if claude is already accessible via PATH
-    const whichResult = await which('claude')
+    const whichResult = await which(getCliBinaryName())
     const claudeInPath = !!whichResult
 
     // Only show warning if claude is NOT in PATH AND no valid alias exists
@@ -469,13 +549,13 @@ async function detectConfigurationIssues(
         // Alias exists but points to invalid target
         warnings.push({
           issue: 'Local installation not accessible',
-          fix: `Alias exists but points to invalid target: ${existingAlias}. Update alias: alias claude="~/.claude/local/claude"`,
+          fix: `Alias exists but points to invalid target: ${existingAlias}. Update alias: alias ${getCliBinaryName()}="~/.openclaude/local/${getCliBinaryName()}"`,
         })
       } else {
         // No alias exists and not in PATH
         warnings.push({
           issue: 'Local installation not accessible',
-          fix: 'Create alias: alias claude="~/.claude/local/claude"',
+          fix: `Create alias: alias ${getCliBinaryName()}="~/.openclaude/local/${getCliBinaryName()}"`,
         })
       }
     }
@@ -580,7 +660,7 @@ export async function getDoctorDiagnostic(): Promise<DiagnosticInfo> {
     if (!hasUpdatePermissions && !getAutoUpdaterDisabledReason()) {
       warnings.push({
         issue: 'Insufficient permissions for auto-updates',
-        fix: 'Do one of: (1) Re-install node without sudo, or (2) Use `claude install` for native installation',
+        fix: `Do one of: (1) Re-install node without sudo, or (2) Use \`${getCliBinaryName()} install\` for native installation`,
       })
     }
   }

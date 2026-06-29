@@ -14,12 +14,12 @@ export function useOfficialMarketplaceNotification() {
 }
 async function _temp() {
   const result = await checkAndInstallOfficialMarketplace();
-  const notifs = [];
+  const notifs: Notification[] = [];
   if (result.configSaveFailed) {
     logForDebugging("Showing marketplace config save failure notification");
     notifs.push({
       key: "marketplace-config-save-failed",
-      jsx: <Text color="error">Failed to save marketplace retry info · Check ~/.claude.json permissions</Text>,
+      jsx: <Text color="error">Failed to save marketplace retry info · Check ~/.openclaude.json permissions</Text>,
       priority: "immediate",
       timeoutMs: 10000
     });
