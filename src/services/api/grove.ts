@@ -204,7 +204,8 @@ async function fetchAndStoreGroveConfig(accountId: string): Promise<void> {
     const groveEnabled = result.data.grove_enabled
     const cachedEntry = getGlobalConfig().groveConfigCache?.[accountId]
     if (
-      cachedEntry?.grove_enabled === groveEnabled &&
+      cachedEntry !== undefined &&
+      cachedEntry.grove_enabled === groveEnabled &&
       Date.now() - cachedEntry.timestamp <= GROVE_CACHE_EXPIRATION_MS
     ) {
       return
@@ -343,13 +344,13 @@ export async function checkGroveForNonInteractive(): Promise<void> {
     if (config === null || config.notice_is_grace_period) {
       // Grace period is still active - show informational message and continue
       writeToStderr(
-        '\nAn update to our Consumer Terms and Privacy Policy will take effect on October 8, 2025. Run `claude` to review the updated terms.\n\n',
+        '\nAn update to our Consumer Terms and Privacy Policy will take effect on October 8, 2025. Run `openclaude` to review the updated terms.\n\n',
       )
       await markGroveNoticeViewed()
     } else {
       // Grace period has ended - show error message and exit
       writeToStderr(
-        '\n[ACTION REQUIRED] An update to our Consumer Terms and Privacy Policy has taken effect on October 8, 2025. You must run `claude` to review the updated terms.\n\n',
+        '\n[ACTION REQUIRED] An update to our Consumer Terms and Privacy Policy has taken effect on October 8, 2025. You must run `openclaude` to review the updated terms.\n\n',
       )
       await gracefulShutdown(1)
     }

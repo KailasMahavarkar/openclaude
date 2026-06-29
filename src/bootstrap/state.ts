@@ -1,9 +1,4 @@
 import type { BetaMessageStreamParams } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
-import type { Attributes, Meter, MetricOptions } from '@opentelemetry/api'
-import type { logs } from '@opentelemetry/api-logs'
-import type { LoggerProvider } from '@opentelemetry/sdk-logs'
-import type { MeterProvider } from '@opentelemetry/sdk-metrics'
-import type { BasicTracerProvider } from '@opentelemetry/sdk-trace-base'
 import { realpathSync } from 'fs'
 import sumBy from 'lodash-es/sumBy.js'
 import { cwd } from 'process'
@@ -27,6 +22,12 @@ import { createSignal } from 'src/utils/signal.js'
 type RegisteredHookMatcher = HookCallbackMatcher | PluginHookMatcher
 
 import type { SessionId } from 'src/types/ids.js'
+import type { ReplayIndexBuilder } from 'src/utils/replayIndexBuilder.js'
+
+type ReplayIndexBuilderEntry = {
+  builder: ReplayIndexBuilder
+  projectDir: string | null
+}
 
 // DO NOT ADD MORE STATE HERE - BE JUDICIOUS WITH GLOBAL STATE
 
@@ -37,10 +38,6 @@ import type { SessionId } from 'src/types/ids.js'
 export type ChannelEntry =
   | { kind: 'plugin'; name: string; marketplace: string; dev?: boolean }
   | { kind: 'server'; name: string; dev?: boolean }
-
-export type AttributedCounter = {
-  add(value: number, additionalAttributes?: Attributes): void
-}
 
 type State = {
   originalCwd: string
@@ -86,27 +83,10 @@ type State = {
   sessionIngressToken: string | null | undefined
   oauthTokenFromFd: string | null | undefined
   apiKeyFromFd: string | null | undefined
-  // Telemetry state
-  meter: Meter | null
-  sessionCounter: AttributedCounter | null
-  locCounter: AttributedCounter | null
-  prCounter: AttributedCounter | null
-  commitCounter: AttributedCounter | null
-  costCounter: AttributedCounter | null
-  tokenCounter: AttributedCounter | null
-  codeEditToolDecisionCounter: AttributedCounter | null
-  activeTimeCounter: AttributedCounter | null
   statsStore: { observe(name: string, value: number): void } | null
   sessionId: SessionId
   // Parent session ID for tracking session lineage (e.g., plan mode -> implementation)
   parentSessionId: SessionId | undefined
-  // Logger state
-  loggerProvider: LoggerProvider | null
-  eventLogger: ReturnType<typeof logs.getLogger> | null
-  // Meter provider state
-  meterProvider: MeterProvider | null
-  // Tracer provider state
-  tracerProvider: BasicTracerProvider | null
   // Agent color state
   agentColorMap: Map<string, AgentColorName>
   agentColorIndex: number
@@ -131,6 +111,10 @@ type State = {
   useCoworkPlugins: boolean
   // Session-only bypass permissions mode flag (not persisted)
   sessionBypassPermissionsMode: boolean
+  // Session startup dangerous permission mode for integrations that need to
+  // preserve the distinction between bypassPermissions and fullAccess before
+  // the app is fully mounted.
+  sessionDangerousPermissionMode: 'bypassPermissions' | 'fullAccess' | null
   // Session-only flag gating the .claude/scheduled_tasks.json watcher
   // (useScheduledTasks). Set by cronScheduler.start() when the JSON has
   // entries, or by CronCreateTool. Not persisted.
@@ -254,6 +238,8 @@ type State = {
   // logAPISuccess to tag the first post-compaction API call so we can
   // distinguish compaction-induced cache misses from TTL expiry.
   pendingPostCompaction: boolean
+  // Replay index builders for tracking tool executions by session
+  replayIndexBuilders: Map<SessionId, ReplayIndexBuilderEntry>
 }
 
 // ALSO HERE - THINK THRICE BEFORE MODIFYING
@@ -317,25 +303,9 @@ function getInitialState(): State {
       'flagSettings',
       'policySettings',
     ],
-    // Telemetry state
-    meter: null,
-    sessionCounter: null,
-    locCounter: null,
-    prCounter: null,
-    commitCounter: null,
-    costCounter: null,
-    tokenCounter: null,
-    codeEditToolDecisionCounter: null,
-    activeTimeCounter: null,
     statsStore: null,
     sessionId: randomUUID() as SessionId,
     parentSessionId: undefined,
-    // Logger state
-    loggerProvider: null,
-    eventLogger: null,
-    // Meter provider state
-    meterProvider: null,
-    tracerProvider: null,
     // Agent color state
     agentColorMap: new Map(),
     agentColorIndex: 0,
@@ -355,6 +325,7 @@ function getInitialState(): State {
     useCoworkPlugins: false,
     // Session-only bypass permissions mode flag (not persisted)
     sessionBypassPermissionsMode: false,
+    sessionDangerousPermissionMode: null,
     // Scheduled tasks disabled until flag or dialog enables them
     scheduledTasksEnabled: false,
     sessionCronTasks: [],
@@ -420,6 +391,8 @@ function getInitialState(): State {
     lastMainRequestId: undefined,
     lastApiCompletionTimestamp: null,
     pendingPostCompaction: false,
+    // Replay index builders for tracking tool executions
+    replayIndexBuilders: new Map(),
   }
 
   return state
@@ -428,28 +401,82 @@ function getInitialState(): State {
 // AND ESPECIALLY HERE
 const STATE: State = getInitialState()
 
+/**
+ * Per-query SDK context for AsyncLocalStorage-based isolation.
+ * When set, overrides global STATE reads for the current async context.
+ *
+ * **Runtime Requirement:** Uses Node.js `async_hooks.AsyncLocalStorage`.
+ * Not available in browsers or non-Node JavaScript environments.
+ * SDK consumers must run in OpenClaude's supported Node.js runtime (>=22.0.0).
+ */
+type SdkContext = {
+  sessionId: SessionId
+  sessionProjectDir: string | null
+  cwd: string
+  originalCwd: string
+  parentSessionId?: SessionId
+}
+
+import { AsyncLocalStorage } from 'async_hooks'
+
+const sdkContextStorage = new AsyncLocalStorage<SdkContext>()
+
+/**
+ * Run a function with an SDK-specific context that overrides global state.
+ * All reads of sessionId, sessionProjectDir, cwd, originalCwd within fn
+ * return context-scoped values instead of global STATE.
+ *
+ * **Node.js Only:** Requires AsyncLocalStorage from async_hooks module.
+ * This function will throw if called in a non-Node environment where
+ * async_hooks is not available.
+ */
+export function runWithSdkContext<T>(context: SdkContext, fn: () => T): T {
+  return sdkContextStorage.run(context, fn)
+}
+
+function getSdkContext(): SdkContext | undefined {
+  return sdkContextStorage.getStore()
+}
+
 export function getSessionId(): SessionId {
-  return STATE.sessionId
+  const ctx = getSdkContext()
+  return ctx?.sessionId ?? STATE.sessionId
 }
 
 export function regenerateSessionId(
   options: { setCurrentAsParent?: boolean } = {},
 ): SessionId {
+  const ctx = getSdkContext()
+  const currentSessionId = ctx?.sessionId ?? STATE.sessionId
   if (options.setCurrentAsParent) {
-    STATE.parentSessionId = STATE.sessionId
+    if (ctx) {
+      ctx.parentSessionId = currentSessionId
+    } else {
+      STATE.parentSessionId = currentSessionId
+    }
   }
   // Drop the outgoing session's plan-slug entry so the Map doesn't
   // accumulate stale keys. Callers that need to carry the slug across
   // (REPL.tsx clearContext) read it before calling clearConversation.
-  STATE.planSlugCache.delete(STATE.sessionId)
+  STATE.planSlugCache.delete(currentSessionId)
   // Regenerated sessions live in the current project: reset projectDir to
   // null so getTranscriptPath() derives from originalCwd.
-  STATE.sessionId = randomUUID() as SessionId
-  STATE.sessionProjectDir = null
-  return STATE.sessionId
+  const newId = randomUUID() as SessionId
+  if (ctx) {
+    ctx.sessionId = newId
+    ctx.sessionProjectDir = null
+  } else {
+    STATE.sessionId = newId
+    STATE.sessionProjectDir = null
+  }
+  return newId
 }
 
 export function getParentSessionId(): SessionId | undefined {
+  const ctx = getSdkContext()
+  if (ctx) {
+    return ctx.parentSessionId
+  }
   return STATE.parentSessionId
 }
 
@@ -469,12 +496,19 @@ export function switchSession(
   sessionId: SessionId,
   projectDir: string | null = null,
 ): void {
+  const ctx = getSdkContext()
+  const currentSessionId = ctx?.sessionId ?? STATE.sessionId
   // Drop the outgoing session's plan-slug entry so the Map stays bounded
   // across repeated /resume. Only the current session's slug is ever read
   // (plans.ts getPlanSlug defaults to getSessionId()).
-  STATE.planSlugCache.delete(STATE.sessionId)
-  STATE.sessionId = sessionId
-  STATE.sessionProjectDir = projectDir
+  STATE.planSlugCache.delete(currentSessionId)
+  if (ctx) {
+    ctx.sessionId = sessionId
+    ctx.sessionProjectDir = projectDir
+  } else {
+    STATE.sessionId = sessionId
+    STATE.sessionProjectDir = projectDir
+  }
   sessionSwitched.emit(sessionId)
 }
 
@@ -494,11 +528,13 @@ export const onSessionSwitch = sessionSwitched.subscribe
  * originalCwd). See `switchSession()`.
  */
 export function getSessionProjectDir(): string | null {
-  return STATE.sessionProjectDir
+  const ctx = getSdkContext()
+  return ctx ? ctx.sessionProjectDir : STATE.sessionProjectDir
 }
 
 export function getOriginalCwd(): string {
-  return STATE.originalCwd
+  const ctx = getSdkContext()
+  return ctx?.originalCwd ?? STATE.originalCwd
 }
 
 /**
@@ -513,6 +549,11 @@ export function getProjectRoot(): string {
 }
 
 export function setOriginalCwd(cwd: string): void {
+  const ctx = getSdkContext()
+  if (ctx) {
+    ctx.originalCwd = cwd.normalize('NFC')
+    return
+  }
   STATE.originalCwd = cwd.normalize('NFC')
 }
 
@@ -525,10 +566,16 @@ export function setProjectRoot(cwd: string): void {
 }
 
 export function getCwdState(): string {
-  return STATE.cwd
+  const ctx = getSdkContext()
+  return ctx?.cwd ?? STATE.cwd
 }
 
 export function setCwdState(cwd: string): void {
+  const ctx = getSdkContext()
+  if (ctx) {
+    ctx.cwd = cwd.normalize('NFC')
+    return
+  }
   STATE.cwd = cwd.normalize('NFC')
 }
 
@@ -945,115 +992,6 @@ export function resetModelStringsForTestingOnly() {
   STATE.modelStrings = null
 }
 
-export function setMeter(
-  meter: Meter,
-  createCounter: (name: string, options: MetricOptions) => AttributedCounter,
-): void {
-  STATE.meter = meter
-
-  // Initialize all counters using the provided factory
-  STATE.sessionCounter = createCounter('claude_code.session.count', {
-    description: 'Count of CLI sessions started',
-  })
-  STATE.locCounter = createCounter('claude_code.lines_of_code.count', {
-    description:
-      "Count of lines of code modified, with the 'type' attribute indicating whether lines were added or removed",
-  })
-  STATE.prCounter = createCounter('claude_code.pull_request.count', {
-    description: 'Number of pull requests created',
-  })
-  STATE.commitCounter = createCounter('claude_code.commit.count', {
-    description: 'Number of git commits created',
-  })
-  STATE.costCounter = createCounter('claude_code.cost.usage', {
-    description: 'Cost of the Claude Code session',
-    unit: 'USD',
-  })
-  STATE.tokenCounter = createCounter('claude_code.token.usage', {
-    description: 'Number of tokens used',
-    unit: 'tokens',
-  })
-  STATE.codeEditToolDecisionCounter = createCounter(
-    'claude_code.code_edit_tool.decision',
-    {
-      description:
-        'Count of code editing tool permission decisions (accept/reject) for Edit, Write, and NotebookEdit tools',
-    },
-  )
-  STATE.activeTimeCounter = createCounter('claude_code.active_time.total', {
-    description: 'Total active time in seconds',
-    unit: 's',
-  })
-}
-
-export function getMeter(): Meter | null {
-  return STATE.meter
-}
-
-export function getSessionCounter(): AttributedCounter | null {
-  return STATE.sessionCounter
-}
-
-export function getLocCounter(): AttributedCounter | null {
-  return STATE.locCounter
-}
-
-export function getPrCounter(): AttributedCounter | null {
-  return STATE.prCounter
-}
-
-export function getCommitCounter(): AttributedCounter | null {
-  return STATE.commitCounter
-}
-
-export function getCostCounter(): AttributedCounter | null {
-  return STATE.costCounter
-}
-
-export function getTokenCounter(): AttributedCounter | null {
-  return STATE.tokenCounter
-}
-
-export function getCodeEditToolDecisionCounter(): AttributedCounter | null {
-  return STATE.codeEditToolDecisionCounter
-}
-
-export function getActiveTimeCounter(): AttributedCounter | null {
-  return STATE.activeTimeCounter
-}
-
-export function getLoggerProvider(): LoggerProvider | null {
-  return STATE.loggerProvider
-}
-
-export function setLoggerProvider(provider: LoggerProvider | null): void {
-  STATE.loggerProvider = provider
-}
-
-export function getEventLogger(): ReturnType<typeof logs.getLogger> | null {
-  return STATE.eventLogger
-}
-
-export function setEventLogger(
-  logger: ReturnType<typeof logs.getLogger> | null,
-): void {
-  STATE.eventLogger = logger
-}
-
-export function getMeterProvider(): MeterProvider | null {
-  return STATE.meterProvider
-}
-
-export function setMeterProvider(provider: MeterProvider | null): void {
-  STATE.meterProvider = provider
-}
-export function getTracerProvider(): BasicTracerProvider | null {
-  return STATE.tracerProvider
-}
-export function setTracerProvider(provider: BasicTracerProvider | null): void {
-  STATE.tracerProvider = provider
-}
-
 export function getIsNonInteractiveSession(): boolean {
   return !STATE.isInteractive
 }
@@ -1267,6 +1205,19 @@ export function setSessionBypassPermissionsMode(enabled: boolean): void {
 
 export function getSessionBypassPermissionsMode(): boolean {
   return STATE.sessionBypassPermissionsMode
+}
+
+export function setSessionDangerousPermissionMode(
+  mode: 'bypassPermissions' | 'fullAccess' | null,
+): void {
+  STATE.sessionDangerousPermissionMode = mode
+}
+
+export function getSessionDangerousPermissionMode():
+  | 'bypassPermissions'
+  | 'fullAccess'
+  | null {
+  return STATE.sessionDangerousPermissionMode
 }
 
 export function setScheduledTasksEnabled(enabled: boolean): void {
@@ -1562,29 +1513,8 @@ export function clearInvokedSkillsForAgent(agentId: string): void {
   }
 }
 
-// Slow operations tracking for dev bar
-const MAX_SLOW_OPERATIONS = 10
-const SLOW_OPERATION_TTL_MS = 10000
-
-export function addSlowOperation(operation: string, durationMs: number): void {
-  if (process.env.USER_TYPE !== 'ant') return
-  // Skip tracking for editor sessions (user editing a prompt file in $EDITOR)
-  // These are intentionally slow since the user is drafting text
-  if (operation.includes('exec') && operation.includes('claude-prompt-')) {
-    return
-  }
-  const now = Date.now()
-  // Remove stale operations
-  STATE.slowOperations = STATE.slowOperations.filter(
-    op => now - op.timestamp < SLOW_OPERATION_TTL_MS,
-  )
-  // Add new operation
-  STATE.slowOperations.push({ operation, durationMs, timestamp: now })
-  // Keep only the most recent operations
-  if (STATE.slowOperations.length > MAX_SLOW_OPERATIONS) {
-    STATE.slowOperations = STATE.slowOperations.slice(-MAX_SLOW_OPERATIONS)
-  }
-}
+// Slow operations tracking removed (was internal-only).
+// Functions kept as no-ops to avoid breaking callers.
 
 const EMPTY_SLOW_OPERATIONS: ReadonlyArray<{
   operation: string
@@ -1592,32 +1522,17 @@ const EMPTY_SLOW_OPERATIONS: ReadonlyArray<{
   timestamp: number
 }> = []
 
+export function addSlowOperation(
+  _operation: string,
+  _durationMs: number,
+): void {}
+
 export function getSlowOperations(): ReadonlyArray<{
   operation: string
   durationMs: number
   timestamp: number
 }> {
-  // Most common case: nothing tracked. Return a stable reference so the
-  // caller's setState() can bail via Object.is instead of re-rendering at 2fps.
-  if (STATE.slowOperations.length === 0) {
-    return EMPTY_SLOW_OPERATIONS
-  }
-  const now = Date.now()
-  // Only allocate a new array when something actually expired; otherwise keep
-  // the reference stable across polls while ops are still fresh.
-  if (
-    STATE.slowOperations.some(op => now - op.timestamp >= SLOW_OPERATION_TTL_MS)
-  ) {
-    STATE.slowOperations = STATE.slowOperations.filter(
-      op => now - op.timestamp < SLOW_OPERATION_TTL_MS,
-    )
-    if (STATE.slowOperations.length === 0) {
-      return EMPTY_SLOW_OPERATIONS
-    }
-  }
-  // Safe to return directly: addSlowOperation() reassigns STATE.slowOperations
-  // before pushing, so the array held in React state is never mutated.
-  return STATE.slowOperations
+  return EMPTY_SLOW_OPERATIONS
 }
 
 export function getMainThreadAgentType(): string | undefined {
@@ -1763,5 +1678,60 @@ export function isReplBridgeActive(): boolean {
 
 export function getReplBridgeHandle(): null {
   return null
+}
+
+// Replay index builder management
+
+/**
+ * Get the replay index builder for the current session.
+ * Creates a new one if none exists.
+ */
+export function getReplayIndexBuilder(): ReplayIndexBuilder {
+  const sessionId = getSessionId()
+  let entry = STATE.replayIndexBuilders.get(sessionId)
+  if (!entry) {
+    // Lazy import to avoid circular dependencies
+    const { ReplayIndexBuilder } =
+      require('src/utils/replayIndexBuilder.js') as typeof import('src/utils/replayIndexBuilder.js')
+    entry = {
+      builder: new ReplayIndexBuilder(),
+      projectDir: getSessionProjectDir(),
+    }
+    STATE.replayIndexBuilders.set(sessionId, entry)
+  }
+  return entry.builder
+}
+
+/**
+ * Reset and return the replay index builder.
+ * Used during session cleanup to get the final index.
+ */
+export function resetReplayIndexBuilder(
+  sessionId: SessionId = getSessionId(),
+): ReplayIndexBuilderEntry | null {
+  const entry = STATE.replayIndexBuilders.get(sessionId) ?? null
+  STATE.replayIndexBuilders.delete(sessionId)
+  return entry
+}
+
+/**
+ * Reset and return all replay index builders.
+ * Used during process cleanup so sessions switched in-process do not mix.
+ */
+export function resetAllReplayIndexBuilders(): Array<{
+  sessionId: SessionId
+  builder: ReplayIndexBuilder
+  projectDir: string | null
+}> {
+  const entries = Array.from(
+    STATE.replayIndexBuilders,
+    ([sessionId, entry]) => ({
+      sessionId,
+      builder: entry.builder,
+      projectDir: entry.projectDir,
+    }),
+  )
+  STATE.replayIndexBuilders.clear()
+  return entries
 }
 

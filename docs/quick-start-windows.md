@@ -4,7 +4,7 @@ This guide uses Windows PowerShell.
 
 ## 1. Install Node.js
 
-Install Node.js 20 or newer from:
+Install Node.js 22 LTS or newer from:
 
 - `https://nodejs.org/`
 
@@ -18,7 +18,7 @@ npm --version
 ## 2. Install OpenClaude
 
 ```powershell
-npm install -g @gitlawb/openclaude
+npm install -g @gitlawb/openclaude@latest
 ```
 
 ## 3. Pick One Provider
@@ -41,10 +41,12 @@ openclaude
 $env:CLAUDE_CODE_USE_OPENAI="1"
 $env:OPENAI_API_KEY="sk-your-key-here"
 $env:OPENAI_BASE_URL="https://api.deepseek.com/v1"
-$env:OPENAI_MODEL="deepseek-chat"
+$env:OPENAI_MODEL="deepseek-v4-flash"
 
 openclaude
 ```
+
+Use `deepseek-v4-pro` when you want the stronger model. `deepseek-chat` and `deepseek-reasoner` still work as DeepSeek's legacy API aliases.
 
 ### Option C: Ollama
 
@@ -65,6 +67,20 @@ openclaude
 ```
 
 No API key is needed for Ollama local models.
+
+OpenClaude asks Ollama for a 32768-token context window on each chat request.
+If you need a different size, set `OPENCLAUDE_OLLAMA_NUM_CTX` before launching
+OpenClaude, or start Ollama with a global context setting:
+
+```powershell
+# Quit any existing Ollama app/server first, then run:
+$env:OLLAMA_CONTEXT_LENGTH="32768"
+ollama serve
+```
+
+After a chat request, run `ollama ps` in another PowerShell window and check the
+`CONTEXT` column. It should show the requested size. If it still shows a small
+value such as `4K`, restart the Ollama app/server and try again.
 
 ### Option D: LM Studio
 
@@ -93,12 +109,40 @@ Replace `your-model-name` with the model name shown in LM Studio.
 
 No API key is needed for LM Studio local models (but uncomment the `OPENAI_API_KEY` line if you hit auth errors).
 
+### Option E: Using a .env file (Optional)
+
+If you prefer to keep your keys in a `.env` file instead of exporting them individually, note that OpenClaude does not load `.env` files automatically. You must explicitly pass it:
+
+```powershell
+openclaude --provider-env-file .env
+```
+
+Keep `.env` out of git because it contains secrets.
+The explicit loader accepts provider/setup variables. Set runtime/debug variables in PowerShell or your launcher instead.
+
 ## 4. If `openclaude` Is Not Found
 
 Close PowerShell, open a new one, and try again:
 
 ```powershell
 openclaude
+```
+
+If PowerShell still says `openclaude` is not recognized, npm's global bin
+folder may be missing from your user `Path`. Add it, then open a new
+PowerShell window:
+
+```powershell
+$npmPrefix = npm config get prefix
+$currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+
+if (($currentUserPath -split ';') -notcontains $npmPrefix) {
+    [Environment]::SetEnvironmentVariable(
+        "Path",
+        "$currentUserPath;$npmPrefix",
+        "User"
+    )
+}
 ```
 
 ## 5. If Your Provider Fails
@@ -115,6 +159,8 @@ Check the basics:
 - make sure Ollama is installed
 - make sure Ollama is running
 - make sure the model was pulled successfully
+- if same-session chat history appears missing, verify the active `CONTEXT`
+  value with `ollama ps`; OpenClaude requests 32K by default
 
 ### For LM Studio
 
@@ -136,8 +182,13 @@ npm install -g @gitlawb/openclaude@latest
 npm uninstall -g @gitlawb/openclaude
 ```
 
+
 ## Need Advanced Setup?
 
-Use:
+For advanced provider setup, custom endpoints, environment variables, and enterprise launch workflows, see the advanced setup guide:
 
-- [Advanced Setup](advanced-setup.md)
+- [Advanced setup](advanced-setup.md)
+
+For Windows helper aliases and launcher shortcuts such as `oc`, `oc-init`, `oc-local`, `oc-provider`, and `oc-check`, see:
+
+- [Windows aliases and launchers](windows-aliases-and-launchers.md)

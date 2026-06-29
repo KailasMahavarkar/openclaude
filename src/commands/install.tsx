@@ -9,7 +9,7 @@ import { Box, render, Text } from '../ink.js';
 import { logForDebugging } from '../utils/debug.js';
 import { env } from '../utils/env.js';
 import { errorMessage } from '../utils/errors.js';
-import { checkInstall, cleanupNpmInstallations, cleanupShellAliases, installLatest } from '../utils/nativeInstaller/index.js';
+import { checkInstall, cleanupNpmInstallations, cleanupShellAliases, installLatest, repairNativeLauncher } from '../utils/nativeInstaller/index.js';
 import { getInitialSettings, updateSettingsForSource } from '../utils/settings/settings.js';
 interface InstallProps {
   onDone: (result: string, options?: {
@@ -39,16 +39,16 @@ type InstallState = {
   message: string;
   warnings?: string[];
 };
-function getInstallationPath(): string {
+export function getInstallationPath(): string {
   const isWindows = env.platform === 'win32';
   const homeDir = homedir();
   if (isWindows) {
     // Convert to Windows-style path
-    const windowsPath = join(homeDir, '.local', 'bin', 'claude.exe');
+    const windowsPath = join(homeDir, '.local', 'bin', 'openclaude.exe');
     // Replace forward slashes with backslashes for Windows display
     return windowsPath.replace(/\//g, '\\');
   }
-  return '~/.local/bin/claude';
+  return '~/.local/bin/openclaude';
 }
 function SetupNotes(t0) {
   const $ = _c(5);
@@ -86,7 +86,7 @@ function SetupNotes(t0) {
 function _temp(message, index) {
   return <Box key={index} marginLeft={2}><Text dimColor={true}>• {message}</Text></Box>;
 }
-function Install({
+export function Install({
   onDone,
   force,
   target
@@ -126,17 +126,10 @@ function Install({
           logForDebugging('Install: Already up to date');
         }
 
-        // Set up launcher and shell integration
-        setState({
-          type: 'setting-up'
-        });
-        const setupMessages = await checkInstall(true);
-        logForDebugging(`Install: Setup launcher completed with ${setupMessages.length} messages`);
-        if (setupMessages.length > 0) {
-          setupMessages.forEach(msg => logForDebugging(`Install: Setup message: ${msg.message}`));
-        }
-
-        // Now that native installation succeeded, clean up old npm installations
+        // Now that native installation succeeded, clean up old npm installations.
+        // npm uninstall owns its bin entries and can remove ~/.local/bin/openclaude
+        // when the npm prefix overlaps the native launcher directory, so repair the
+        // native launcher after cleanup before checking the final install state.
         logForDebugging('Install: Cleaning up npm installations after successful install');
         const {
           removed,
@@ -151,6 +144,21 @@ function Install({
           // Continue despite cleanup errors - native install already succeeded
         }
 
+        setState({
+          type: 'setting-up'
+        });
+        if (!result.latestVersion) {
+          throw new Error('Could not repair native launcher - installed version is unknown.');
+        }
+        logForDebugging(`Install: Repairing native launcher after npm cleanup`);
+        await repairNativeLauncher(result.latestVersion);
+
+        // Set up launcher and shell integration against the final post-cleanup state
+        const setupMessages = await checkInstall(true);
+        logForDebugging(`Install: Setup launcher completed with ${setupMessages.length} messages`);
+        if (setupMessages.length > 0) {
+          setupMessages.forEach(msg => logForDebugging(`Install: Setup message: ${msg.message}`));
+        }
         // Clean up old shell aliases
         const aliasMessages = await cleanupShellAliases();
         if (aliasMessages.length > 0) {
@@ -210,12 +218,12 @@ function Install({
   useEffect(() => {
     if (state.type === 'success') {
       // Give success message time to render before exiting
-      setTimeout(onDone, 2000, 'Claude Code installation completed successfully', {
+      setTimeout(onDone, 2000, 'OpenClaude installation completed successfully', {
         display: 'system' as const
       });
     } else if (state.type === 'error') {
       // Give error message time to render before exiting
-      setTimeout(onDone, 3000, 'Claude Code installation failed', {
+      setTimeout(onDone, 3000, 'OpenClaude installation failed', {
         display: 'system' as const
       });
     }
@@ -226,7 +234,7 @@ function Install({
       {state.type === 'cleaning-npm' && <Text color="warning">Cleaning up old npm installations...</Text>}
 
       {state.type === 'installing' && <Text color="claude">
-          Installing Claude Code native build {state.version}...
+          Installing OpenClaude native build {state.version}...
         </Text>}
 
       {state.type === 'setting-up' && <Text color="claude">Setting up launcher and shell integration...</Text>}
@@ -237,7 +245,7 @@ function Install({
           <Box>
             <StatusIcon status="success" withSpace />
             <Text color="success" bold>
-              Claude Code successfully installed!
+              OpenClaude successfully installed!
             </Text>
           </Box>
           <Box marginLeft={2} flexDirection="column" gap={1}>
@@ -254,7 +262,7 @@ function Install({
             <Box marginTop={1}>
               <Text dimColor>Next: Run </Text>
               <Text color="claude" bold>
-                claude --help
+                openclaude --help
               </Text>
               <Text dimColor> to get started</Text>
             </Box>
@@ -279,7 +287,7 @@ function Install({
 export const install = {
   type: 'local-jsx' as const,
   name: 'install',
-  description: 'Install Claude Code native build',
+  description: 'Install OpenClaude native build',
   argumentHint: '[options]',
   async call(onDone: (result: string, options?: {
     display?: CommandResultDisplay;

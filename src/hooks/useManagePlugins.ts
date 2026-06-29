@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useSyncExternalStore } from 'react'
 import type { Command } from '../commands.js'
 import { useNotifications } from '../context/notifications.js'
 import {
@@ -7,7 +7,13 @@ import {
 } from '../services/analytics/index.js'
 import { reinitializeLspServerManager } from '../services/lsp/manager.js'
 import { useAppState, useSetAppState } from '../state/AppState.js'
+import {
+  getPluginCommandsState,
+  setPluginCommandsState,
+  subscribePluginCommands,
+} from '../state/pluginCommandsStore.js'
 import type { AgentDefinition } from '../tools/AgentTool/loadAgentsDir.js'
+import type { LoadedPlugin } from '../types/plugin.js'
 import { count } from '../utils/array.js'
 import { logForDebugging } from '../utils/debug.js'
 import { logForDiagnosticsNoPII } from '../utils/diagLogs.js'
@@ -21,6 +27,7 @@ import { loadPluginMcpServers } from '../utils/plugins/mcpPluginIntegration.js'
 import { detectAndUninstallDelistedPlugins } from '../utils/plugins/pluginBlocklist.js'
 import { getFlaggedPlugins } from '../utils/plugins/pluginFlagging.js'
 import { loadAllPlugins } from '../utils/plugins/pluginLoader.js'
+import type { HookMatcher, HooksSettings } from '../utils/settings/types.js'
 
 /**
  * Hook to manage plugin state and synchronize with AppState.
@@ -39,6 +46,11 @@ export function useManagePlugins({
 }: {
   enabled?: boolean
 } = {}) {
+  const pluginCommands = useSyncExternalStore(
+    subscribePluginCommands,
+    getPluginCommandsState,
+    getPluginCommandsState,
+  )
   const setAppState = useSetAppState()
   const needsRefresh = useAppState(s => s.plugins.needsRefresh)
   const { addNotification } = useNotifications()
@@ -52,6 +64,7 @@ export function useManagePlugins({
     try {
       // Load all plugins - capture errors array
       const { enabled, disabled, errors } = await loadAllPlugins()
+      const enabledPlugins = enabled as LoadedPlugin[]
 
       // Detect delisted plugins, auto-uninstall them, and record as flagged.
       await detectAndUninstallDelistedPlugins()
@@ -74,6 +87,7 @@ export function useManagePlugins({
 
       try {
         commands = await getPluginCommands()
+        setPluginCommandsState(commands)
       } catch (error) {
         const errorMessage =
           error instanceof Error ? error.message : String(error)
@@ -82,6 +96,7 @@ export function useManagePlugins({
           source: 'plugin-commands',
           error: `Failed to load plugin commands: ${errorMessage}`,
         })
+        setPluginCommandsState([])
       }
 
       try {
@@ -118,7 +133,7 @@ export function useManagePlugins({
       // Runs BEFORE setAppState so any errors pushed by these loaders make it
       // into AppState.plugins.errors (Doctor UI), not just telemetry.
       const mcpServerCounts = await Promise.all(
-        enabled.map(async p => {
+        enabledPlugins.map(async p => {
           if (p.mcpServers) return Object.keys(p.mcpServers).length
           const servers = await loadPluginMcpServers(p, errors)
           if (servers) p.mcpServers = servers
@@ -134,7 +149,7 @@ export function useManagePlugins({
       // invalidation happened between main.tsx:3203 and REPL mount (e.g.
       // seed marketplace registration or policySettings hot-reload).
       const lspServerCounts = await Promise.all(
-        enabled.map(async p => {
+        enabledPlugins.map(async p => {
           if (p.lspServers) return Object.keys(p.lspServers).length
           const servers = await loadPluginLspServers(p, errors)
           if (servers) p.lspServers = servers
@@ -171,24 +186,26 @@ export function useManagePlugins({
           ...prevState,
           plugins: {
             ...prevState.plugins,
-            enabled,
+            enabled: enabledPlugins,
             disabled,
-            commands,
+            commands: [],
             errors: mergedErrors,
           },
         }
       })
 
       logForDebugging(
-        `Loaded plugins - Enabled: ${enabled.length}, Disabled: ${disabled.length}, Commands: ${commands.length}, Agents: ${agents.length}, Errors: ${errors.length}`,
+        `Loaded plugins - Enabled: ${enabledPlugins.length}, Disabled: ${disabled.length}, Commands: ${commands.length}, Agents: ${agents.length}, Errors: ${errors.length}`,
       )
 
       // Count component types across enabled plugins
-      const hook_count = enabled.reduce((sum, p) => {
+      const hook_count = enabledPlugins.reduce((sum, p) => {
         if (!p.hooksConfig) return sum
         return (
           sum +
-          Object.values(p.hooksConfig).reduce(
+          (Object.values(p.hooksConfig as HooksSettings) as Array<
+            HookMatcher[] | undefined
+          >).reduce(
             (s, matchers) =>
               s + (matchers?.reduce((h, m) => h + m.hooks.length, 0) ?? 0),
             0,
@@ -197,10 +214,10 @@ export function useManagePlugins({
       }, 0)
 
       return {
-        enabled_count: enabled.length,
+        enabled_count: enabledPlugins.length,
         disabled_count: disabled.length,
-        inline_count: count(enabled, p => p.source.endsWith('@inline')),
-        marketplace_count: count(enabled, p => !p.source.endsWith('@inline')),
+        inline_count: count(enabledPlugins, p => p.source.endsWith('@inline')),
+        marketplace_count: count(enabledPlugins, p => !p.source.endsWith('@inline')),
         error_count: errors.length,
         skill_count: commands.length,
         agent_count: agents.length,
@@ -226,6 +243,7 @@ export function useManagePlugins({
       logError(errorObj)
       logForDebugging(`Error loading plugins: ${error}`)
       // Set empty state on error, but preserve LSP errors and add the new error
+      setPluginCommandsState([])
       setAppState(prevState => {
         // Keep existing LSP/non-plugin-loading errors
         const existingLspErrors = prevState.plugins.errors.filter(
@@ -284,6 +302,11 @@ export function useManagePlugins({
     })
   }, [initialPluginLoad, enabled])
 
+  useEffect(() => {
+    if (enabled) return
+    setPluginCommandsState([])
+  }, [enabled])
+
   // Plugin state changed on disk (background reconcile, /plugin menu,
   // external settings edit). Show a notification; user runs /reload-plugins
   // to apply. The previous auto-refresh here had a stale-cache bug (only
@@ -301,4 +324,6 @@ export function useManagePlugins({
     // Do NOT auto-refresh. Do NOT reset needsRefresh — /reload-plugins
     // consumes it via refreshActivePlugins().
   }, [enabled, needsRefresh, addNotification])
+
+  return enabled ? pluginCommands : []
 }

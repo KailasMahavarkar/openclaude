@@ -55,6 +55,7 @@ import { type MCPProgress, MCPTool } from '../../tools/MCPTool/MCPTool.js'
 import { createMcpAuthTool } from '../../tools/McpAuthTool/McpAuthTool.js'
 import { ReadMcpResourceTool } from '../../tools/ReadMcpResourceTool/ReadMcpResourceTool.js'
 import { createAbortController } from '../../utils/abortController.js'
+import { AbortError, isAbortError } from '../../utils/errors.js'
 import { count } from '../../utils/array.js'
 import {
   checkAndRefreshOAuthTokenIfNeeded,
@@ -206,9 +207,12 @@ export function isMcpSessionExpiredError(error: Error): boolean {
 }
 
 /**
- * Default timeout for MCP tool calls (effectively infinite - ~27.8 hours).
+ * Default timeout for MCP tool calls (5 minutes — reasonable for most tools).
+ * Use MCP_TOOL_TIMEOUT env var to override per-server.
+ * The previous default of ~27.8 hours effectively meant no timeout, causing
+ * tools to hang indefinitely on unresponsive servers.
  */
-const DEFAULT_MCP_TOOL_TIMEOUT_MS = 100_000_000
+const DEFAULT_MCP_TOOL_TIMEOUT_MS = 300_000
 
 /**
  * Cap on MCP tool descriptions and server instructions sent to the model.
@@ -574,6 +578,21 @@ export async function cleanupFailedConnection(
   }
 
   await transport.close().catch(() => {})
+}
+
+export function logMcpServerStderr(
+  name: string,
+  stderrOutput: string,
+  connectedSuccessfully: boolean,
+): void {
+  if (!stderrOutput) return
+
+  const message = `Server stderr: ${stderrOutput}`
+  if (connectedSuccessfully) {
+    logMCPDebug(name, message)
+  } else {
+    logMCPError(name, message)
+  }
 }
 
 function isLocalMcpServer(config: ScopedMcpServerConfig): boolean {
@@ -956,11 +975,17 @@ export const connectToServer = memoize(
         transport = clientTransport
         logMCPDebug(name, `In-process Computer Use MCP server started`)
       } else if (serverRef.type === 'stdio' || !serverRef.type) {
-        const finalCommand =
-          process.env.CLAUDE_CODE_SHELL_PREFIX || serverRef.command
-        const finalArgs = process.env.CLAUDE_CODE_SHELL_PREFIX
-          ? [[serverRef.command, ...serverRef.args].join(' ')]
-          : serverRef.args
+        // Split the prefix into separate args so we hand a real array to the
+        // MCP SDK's stdio transport.  Joining the server command + its args
+        // into one string and putting that single string inside a one-element
+        // array causes the SDK to shell-invoke the whole blob, letting shell
+        // metacharacters in serverRef.args run arbitrary commands before the
+        // target binary even starts.
+        const { command: finalCommand, args: finalArgs } = buildMcpStdioCommand(
+          serverRef.command,
+          serverRef.args ?? [],
+          process.env.CLAUDE_CODE_SHELL_PREFIX,
+        )
         transport = new StdioClientTransport({
           command: finalCommand,
           args: finalArgs,
@@ -998,10 +1023,12 @@ export const connectToServer = memoize(
 
       const client = new Client(
         {
+          // name stays 'claude-code' for compatibility with MCP servers that
+          // gate features on the upstream client identifier.
           name: 'claude-code',
-          title: 'Open Claude',
+          title: 'OpenClaude',
           version: MACRO.VERSION ?? 'unknown',
-          description: "Anthropic's agentic coding tool",
+          description: 'OpenClaude — coding-agent CLI for any LLM provider',
           websiteUrl: PRODUCT_URL,
         },
         {
@@ -1093,7 +1120,7 @@ export const connectToServer = memoize(
       try {
         await Promise.race([connectPromise, timeoutPromise])
         if (stderrOutput) {
-          logMCPError(name, `Server stderr: ${stderrOutput}`)
+          logMcpServerStderr(name, stderrOutput, true)
           stderrOutput = '' // Release accumulated string to prevent memory growth
         }
         const elapsed = Date.now() - connectStartTime
@@ -1164,7 +1191,7 @@ export const connectToServer = memoize(
           await cleanupFailedConnection(transport)
         }
         if (stderrOutput) {
-          logMCPError(name, `Server stderr: ${stderrOutput}`)
+          logMcpServerStderr(name, stderrOutput, false)
         }
         throw error
       }
@@ -1764,10 +1791,32 @@ export const fetchToolsForClient = memoizeWithLRU(
         return []
       }
 
-      const result = (await client.client.request(
-        { method: 'tools/list' },
-        ListToolsResultSchema,
-      )) as ListToolsResult
+      // Retry tool list fetch up to 2 times on transient failures.
+      // Without retry, a single timeout during tools/list makes all MCP tools
+      // silently disappear from the model's context until the next reconnect.
+      let result: ListToolsResult | undefined
+      let lastError: unknown
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          result = (await client.client.request(
+            { method: 'tools/list' },
+            ListToolsResultSchema,
+          )) as ListToolsResult
+          break
+        } catch (err) {
+          lastError = err
+          if (attempt < 2) {
+            logMCPDebug(
+              client.name,
+              `tools/list failed (attempt ${attempt + 1}/3): ${errorMessage(err)}. Retrying...`,
+            )
+            await sleep(1000 * (attempt + 1))
+          }
+        }
+      }
+      if (!result) {
+        throw lastError ?? new Error('tools/list failed after 3 attempts')
+      }
 
       // Sanitize tool data from MCP server
       const toolsToProcess = recursivelySanitizeUnicode(result.tools)
@@ -2499,7 +2548,7 @@ export async function transformResultContent(
       return [
         {
           type: 'text',
-          text: resultContent.text,
+          text: recursivelySanitizeUnicode(resultContent.text) as string,
         },
       ]
     case 'audio': {
@@ -2544,7 +2593,9 @@ export async function transformResultContent(
         return [
           {
             type: 'text',
-            text: `${prefix}${resource.text}`,
+            text: recursivelySanitizeUnicode(
+              `${prefix}${resource.text}`,
+            ) as string,
           },
         ]
       } else if ('blob' in resource) {
@@ -2864,6 +2915,11 @@ export async function callMCPToolWithUrlElicitationRetry({
 }): Promise<MCPToolCallResult> {
   const MAX_URL_ELICITATION_RETRIES = 3
   for (let attempt = 0; ; attempt++) {
+    // Check abort signal before each attempt — without this, a cancelled
+    // elicitation retry loop continues spinning until MAX retries
+    if (signal.aborted) {
+      throw new Error('Tool call aborted during URL elicitation')
+    }
     try {
       return await callToolFn({
         client: connectedClient,
@@ -3156,9 +3212,12 @@ async function callMCPTool({
         errorDetails = String(result.error)
       }
       logMCPError(name, errorDetails)
+      // Include server and tool name in telemetry for debugging, but keep
+      // the human-readable message unchanged to avoid breaking error consumers
+      // that parse the message string.
       throw new McpToolCallError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS(
         errorDetails,
-        'MCP tool returned error',
+        `MCP tool [${name}] ${tool}: ${errorDetails}`,
         '_meta' in result && result._meta ? { _meta: result._meta } : undefined,
       )
     }
@@ -3246,11 +3305,18 @@ async function callMCPTool({
       }
     }
 
-    // When the users hits esc, avoid logspew
-    if (!(e instanceof Error) || e.name !== 'AbortError') {
-      throw e
+    // When the user hits esc, convert to our AbortError class so the tool
+    // execution framework handles it properly (skips logging, creates
+    // is_error: true result with [Request interrupted by user for tool use]).
+    // Previously this returned { content: undefined }, which masked the
+    // cancellation and caused mapToolResultToToolResultBlockParam to send
+    // empty/undefined content to the API as if it were a successful result.
+    if (isAbortError(e)) {
+      throw new AbortError(
+        e instanceof Error ? e.message : 'Tool execution cancelled',
+      )
     }
-    return { content: undefined }
+    throw e
   } finally {
     // Always clear intervals
     if (progressInterval !== undefined) {
@@ -3264,6 +3330,66 @@ function extractToolUseId(message: AssistantMessage): string | undefined {
     return undefined
   }
   return message.message.content[0].id
+}
+
+/**
+ * Build the command and args for a stdio MCP transport, applying the
+ * CLAUDE_CODE_SHELL_PREFIX split into separate argv entries. This
+ * ensures the MCP SDK receives a proper command + args[] instead of
+ * a shell-joined string, preventing shell metacharacter injection
+ * from serverRef.args.
+ *
+ * When a prefix is set, prefixParts[0] becomes the command and
+ * prefixParts[1..] + original command + original args become the
+ * argv array.
+ */
+export function buildMcpStdioCommand(
+  command: string,
+  args: string[],
+  shellPrefix?: string,
+): { command: string; args: string[] } {
+  if (!shellPrefix) {
+    return { command, args }
+  }
+
+  let finalCommand: string
+  let prefixArgs: string[]
+
+  // Split on the last " -c" to preserve spaced executable path
+  // (e.g. "C:\Program Files\Git\bin\bash.exe -c"). When no " -c" is
+  // present, fall back to plain whitespace split.
+  const cIndex = shellPrefix.lastIndexOf(' -c')
+  if (cIndex > 0) {
+    finalCommand = shellPrefix.substring(0, cIndex)
+    prefixArgs = ['-c', ...shellPrefix.substring(cIndex + 3).split(/\s+/).filter(Boolean)]
+  } else {
+    const parts = shellPrefix.split(/\s+/).filter(Boolean)
+    if (parts.length === 0) return { command, args }
+    finalCommand = parts[0]
+    prefixArgs = parts.slice(1)
+  }
+
+  // Shell -c prefix (e.g. sh -c, bash -c): everything after -c is a single
+  // shell command string, not individual argv entries. Without this join,
+  // sh -c runs only the first word as the command string and treats the
+  // remaining entries as shell positional parameters ($0, $1, ...), so the
+  // MCP server never receives its configured arguments.
+  //
+  // Each original command/arg is single-quote-escaped to prevent shell
+  // injection via MCP server args (e.g. --path=/tmp; rm -rf / would
+  // otherwise execute the semicolon as a command separator).
+  if (prefixArgs.includes('-c')) {
+    const cmdStr = [command, ...args].map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')
+    return {
+      command: finalCommand,
+      args: [...prefixArgs, cmdStr],
+    }
+  }
+
+  return {
+    command: finalCommand,
+    args: [...prefixArgs, command, ...args],
+  }
 }
 
 /**
@@ -3294,10 +3420,12 @@ export async function setupSdkMcpClients(
 
       const client = new Client(
         {
+          // name stays 'claude-code' for compatibility with MCP servers that
+          // gate features on the upstream client identifier.
           name: 'claude-code',
-          title: 'Open Claude',
+          title: 'OpenClaude',
           version: MACRO.VERSION ?? 'unknown',
-          description: "Anthropic's agentic coding tool",
+          description: 'OpenClaude — coding-agent CLI for any LLM provider',
           websiteUrl: PRODUCT_URL,
         },
         {

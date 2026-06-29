@@ -39,7 +39,7 @@ import { buildImageToolResult, isImageOutput, resetCwdIfOutsideProject, resizeSh
 import { trackGitOperations } from '../shared/gitOperationTracking.js';
 import { interpretCommandResult } from './commandSemantics.js';
 import { powershellToolHasPermission } from './powershellPermissions.js';
-import { getDefaultTimeoutMs, getMaxTimeoutMs, getPrompt } from './prompt.js';
+import { getEffectiveTimeoutMs, getMaxTimeoutMs, getPrompt } from './prompt.js';
 import { hasSyncSecurityConcerns, isReadOnlyCommand, resolveToCanonical } from './readOnlyValidation.js';
 import { POWERSHELL_TOOL_NAME } from './toolName.js';
 import { renderToolResultMessage, renderToolUseErrorMessage, renderToolUseMessage, renderToolUseProgressMessage, renderToolUseQueuedMessage } from './UI.js';
@@ -230,13 +230,20 @@ const fullInputSchema = lazySchema(() => z.strictObject({
   timeout: semanticNumber(z.number().optional()).describe(`Optional timeout in milliseconds (max ${getMaxTimeoutMs()})`),
   description: z.string().optional().describe('Clear, concise description of what this command does in active voice.'),
   run_in_background: semanticBoolean(z.boolean().optional()).describe(`Set to true to run this command in the background. Use Read to read the output later.`),
-  dangerouslyDisableSandbox: semanticBoolean(z.boolean().optional()).describe('Set this to true to dangerously override sandbox mode and run commands without sandboxing.')
+  dangerouslyDisableSandbox: semanticBoolean(z.boolean().optional()).describe('Set this to true to dangerously override sandbox mode and run commands without sandboxing.'),
+  _dangerouslyDisableSandboxApproved: z.boolean().optional().describe('Internal: user-approved sandbox override')
 }));
 
-// Conditionally remove run_in_background from schema when background tasks are disabled
+// Omit internal-only sandbox override fields from the model-facing schema.
+// Conditionally remove run_in_background from schema when background tasks are disabled.
 const inputSchema = lazySchema(() => isBackgroundTasksDisabled ? fullInputSchema().omit({
-  run_in_background: true
-}) : fullInputSchema());
+  run_in_background: true,
+  dangerouslyDisableSandbox: true,
+  _dangerouslyDisableSandboxApproved: true
+}) : fullInputSchema().omit({
+  dangerouslyDisableSandbox: true,
+  _dangerouslyDisableSandboxApproved: true
+}));
 type InputSchema = ReturnType<typeof inputSchema>;
 
 // Use fullInputSchema for the type to always include run_in_background
@@ -697,9 +704,10 @@ async function* runPowerShellCommand({
     description,
     timeout,
     run_in_background,
-    dangerouslyDisableSandbox
+    dangerouslyDisableSandbox,
+    _dangerouslyDisableSandboxApproved
   } = input;
-  const timeoutMs = Math.min(timeout || getDefaultTimeoutMs(), getMaxTimeoutMs());
+  const timeoutMs = getEffectiveTimeoutMs(timeout);
   let fullOutput = '';
   let lastProgressOutput = '';
   let lastTotalLines = 0;
@@ -749,7 +757,8 @@ async function* runPowerShellCommand({
       // The explicit platform check is redundant-but-obvious.
       shouldUseSandbox: getPlatform() === 'windows' ? false : shouldUseSandbox({
         command,
-        dangerouslyDisableSandbox
+        dangerouslyDisableSandbox,
+        _dangerouslyDisableSandboxApproved
       }),
       shouldAutoBackground
     });

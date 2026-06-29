@@ -2,6 +2,7 @@ import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs
 import type { UUID } from 'crypto'
 import type React from 'react'
 import type { PermissionResult } from '../entrypoints/agentSdkTypes.js'
+import type { Command } from '../commands.js'
 import type { Key } from '../ink.js'
 import type { PastedContent } from '../utils/config.js'
 import type { ImageDimensions } from '../utils/imageResizer.js'
@@ -226,8 +227,10 @@ export type VimMode = 'INSERT' | 'NORMAL'
  */
 export type BaseInputState = {
   onInput: (input: string, key: Key) => void
+  value: string
   renderedValue: string
   offset: number
+  setValue: (value: string, offset?: number) => void
   setOffset: (offset: number) => void
   /** Cursor line (0-indexed) within the rendered text, accounting for wrapping. */
   cursorLine: number
@@ -318,6 +321,7 @@ export type QueuedCommand = {
    * trigger local slash commands or skills.
    */
   skipSlashCommands?: boolean
+  slashCommandOverride?: Command
   /**
    * When true, slash commands are dispatched but filtered through
    * isBridgeSafeCommand() — 'local-jsx' and terminal-only commands return

@@ -1,30 +1,256 @@
 import memoize from 'lodash-es/memoize.js'
-import { existsSync } from 'fs'
+import {
+  copyFileSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+} from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 
-// Memoized: 150+ callers, many on hot paths. Keyed off CLAUDE_CONFIG_DIR so
-// tests that change the env var get a fresh value without explicit cache.clear.
+const LEGACY_GLOBAL_CONFIG_FILE_RE =
+  /^\.claude(?:-(?:custom|local|staging)-oauth)?\.json$/
+
+function getErrnoCode(error: unknown): string | undefined {
+  if (
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof error.code === 'string'
+  ) {
+    return error.code
+  }
+  return undefined
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') {
+      return false
+    }
+    return true
+  }
+}
+
+function pathIsDirectory(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function getSymlinkType(source: string): 'dir' | 'file' | 'junction' {
+  if (process.platform !== 'win32') {
+    return 'file'
+  }
+
+  try {
+    return statSync(source).isDirectory() ? 'junction' : 'file'
+  } catch {
+    return 'file'
+  }
+}
+
+function copyMissingPathSync(source: string, destination: string): void {
+  const sourceStats = lstatSync(source)
+
+  if (sourceStats.isDirectory()) {
+    if (!pathExists(destination)) {
+      // Match fsOperations' recursive mkdir behavior while keeping this module
+      // independent from the config-home resolver it backs.
+      mkdirSync(destination, { recursive: true })
+    } else if (!lstatSync(destination).isDirectory()) {
+      throw new Error(`Cannot migrate ${source}: ${destination} is not a directory`)
+    }
+
+    for (const entry of readdirSync(source)) {
+      copyMissingPathSync(join(source, entry), join(destination, entry))
+    }
+    return
+  }
+
+  if (pathExists(destination)) {
+    return
+  }
+
+  mkdirSync(dirname(destination), { recursive: true })
+
+  if (sourceStats.isSymbolicLink()) {
+    symlinkSync(readlinkSync(source), destination, getSymlinkType(source))
+    return
+  }
+
+  if (sourceStats.isFile()) {
+    copyFileSync(source, destination)
+  }
+}
+
+function getLegacyGlobalConfigFiles(homeDir: string): string[] {
+  try {
+    return readdirSync(homeDir).filter(file =>
+      LEGACY_GLOBAL_CONFIG_FILE_RE.test(file),
+    )
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') {
+      return []
+    }
+    throw error
+  }
+}
+
+export function migrateLegacyClaudeConfigHome(options?: {
+  configDirEnv?: string
+  homeDir?: string
+}): boolean {
+  if (options?.configDirEnv) {
+    return true
+  }
+
+  const homeDir = options?.homeDir ?? homedir()
+  const openClaudeDir = join(homeDir, '.openclaude')
+  const legacyClaudeDir = join(homeDir, '.claude')
+
+  try {
+    const legacyDirExists = pathIsDirectory(legacyClaudeDir)
+    const legacyGlobalConfigFiles = getLegacyGlobalConfigFiles(homeDir)
+
+    if (!legacyDirExists && legacyGlobalConfigFiles.length === 0) {
+      return true
+    }
+
+    if (legacyDirExists) {
+      copyMissingPathSync(legacyClaudeDir, openClaudeDir)
+    }
+
+    for (const legacyFile of legacyGlobalConfigFiles) {
+      const openClaudeFile = legacyFile.replace(/^\.claude/, '.openclaude')
+      copyMissingPathSync(
+        join(homeDir, legacyFile),
+        join(homeDir, openClaudeFile),
+      )
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolves the override env value for the config home directory.
+ * `OPENCLAUDE_CONFIG_DIR` is preferred — `CLAUDE_CONFIG_DIR` is the legacy
+ * Anthropic name kept working for backward compatibility. When both are set
+ * and disagree, `OPENCLAUDE_CONFIG_DIR` wins and we warn once so the user
+ * can clean up. Exported for tests.
+ */
+let warnedAboutConflictingConfigDirEnvs = false
+
+export function resolveConfigDirEnv(options?: {
+  openClaudeConfigDir?: string
+  legacyConfigDir?: string
+  warn?: (message: string) => void
+}): string | undefined {
+  const open = options?.openClaudeConfigDir
+  const legacy = options?.legacyConfigDir
+  if (open && legacy && open !== legacy && !warnedAboutConflictingConfigDirEnvs) {
+    const message = `Both OPENCLAUDE_CONFIG_DIR and CLAUDE_CONFIG_DIR are set to different values. Using OPENCLAUDE_CONFIG_DIR=${open}; ignoring CLAUDE_CONFIG_DIR=${legacy}.`
+    if (options?.warn) {
+      warnedAboutConflictingConfigDirEnvs = true
+      options.warn(message)
+    }
+  }
+  return open || legacy || undefined
+}
+
+/**
+ * Test-only escape hatch — resets the once-per-process conflict warning so
+ * unit tests can re-trigger it.
+ */
+export function __resetConfigDirEnvWarningForTesting(): void {
+  warnedAboutConflictingConfigDirEnvs = false
+}
+
+export function resolveClaudeConfigHomeDir(options?: {
+  configDirEnv?: string
+  homeDir?: string
+}): string {
+  if (options?.configDirEnv) {
+    return options.configDirEnv.normalize('NFC')
+  }
+
+  const homeDir = options?.homeDir ?? homedir()
+  const openClaudeDir = join(homeDir, '.openclaude')
+
+  return openClaudeDir.normalize('NFC')
+}
+
+let claudeConfigHomeDirOverride: string | undefined
+
+export function setClaudeConfigHomeDirForTesting(
+  configDir: string | undefined,
+): void {
+  claudeConfigHomeDirOverride = configDir?.normalize('NFC')
+}
+
+export function getClaudeConfigHomeDirOverrideForTesting(): string | undefined {
+  return claudeConfigHomeDirOverride
+}
+
+// Memoized: 150+ callers, many on hot paths. Keyed off both override env
+// vars so tests that change either get a fresh value without explicit
+// cache.clear.
 export const getClaudeConfigHomeDir = memoize(
   (): string => {
-    if (process.env.CLAUDE_CONFIG_DIR) {
-      return process.env.CLAUDE_CONFIG_DIR.normalize('NFC')
+    if (claudeConfigHomeDirOverride) {
+      return claudeConfigHomeDirOverride
     }
-    const newDefault = join(homedir(), '.openclaude')
-    // Migration compatibility: if ~/.openclaude doesn't exist yet but ~/.claude
-    // does, keep using ~/.claude so existing users don't lose their data on
-    // upgrade. New installs (neither dir exists) go straight to ~/.openclaude.
-    const legacyPath = join(homedir(), '.claude')
-    if (!existsSync(newDefault) && existsSync(legacyPath)) {
-      return legacyPath.normalize('NFC')
+
+    const configDirEnv = resolveConfigDirEnv({
+      openClaudeConfigDir: process.env.OPENCLAUDE_CONFIG_DIR,
+      legacyConfigDir: process.env.CLAUDE_CONFIG_DIR,
+      warn: message => {
+        // eslint-disable-next-line no-console
+        console.warn(`[openclaude] ${message}`)
+      },
+    })
+    const homeDir = homedir()
+    const migrationSucceeded = migrateLegacyClaudeConfigHome({
+      configDirEnv,
+      homeDir,
+    })
+    const openClaudeDir = join(homeDir, '.openclaude')
+    const legacyClaudeDir = join(homeDir, '.claude')
+
+    if (
+      !configDirEnv &&
+      !migrationSucceeded &&
+      !pathIsDirectory(openClaudeDir) &&
+      pathExists(legacyClaudeDir)
+    ) {
+      return legacyClaudeDir.normalize('NFC')
     }
-    return newDefault.normalize('NFC')
+
+    return resolveClaudeConfigHomeDir({
+      configDirEnv,
+      homeDir,
+    })
   },
-  () => process.env.CLAUDE_CONFIG_DIR,
+  () =>
+    `${claudeConfigHomeDirOverride ?? ''}\0${process.env.OPENCLAUDE_CONFIG_DIR ?? ''}\0${process.env.CLAUDE_CONFIG_DIR ?? ''}`,
 )
 
 export function getTeamsDir(): string {
   return join(getClaudeConfigHomeDir(), 'teams')
+}
+
+export function getProjectsDir(): string {
+  return join(getClaudeConfigHomeDir(), 'projects')
 }
 
 /**

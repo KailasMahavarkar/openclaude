@@ -232,7 +232,7 @@ function parseSettingsFileUncached(path: string): {
 
 /**
  * Get the absolute path to the associated file root for a given settings source
- * (e.g. for $PROJ_DIR/.claude/settings.json, returns $PROJ_DIR)
+ * (e.g. for $PROJ_DIR/.openclaude/settings.json, returns $PROJ_DIR)
  * @param source The source of the settings
  * @returns The root path of the settings file
  */
@@ -300,9 +300,9 @@ export function getRelativeSettingsFilePathForSource(
 ): string {
   switch (source) {
     case 'projectSettings':
-      return join('.claude', 'settings.json')
+      return '.openclaude/settings.json'
     case 'localSettings':
-      return join('.claude', 'settings.local.json')
+      return '.openclaude/settings.local.json'
   }
 }
 
@@ -574,6 +574,7 @@ export function getManagedSettingsKeysForLogging(
       'ask',
       'defaultMode',
       'disableBypassPermissionsMode',
+      'allowBypassPermissionsMode',
       ...(feature('TRANSCRIPT_CLASSIFIER') ? ['disableAutoMode'] : []),
       'additionalDirectories',
     ]),
@@ -635,8 +636,19 @@ export function getManagedSettingsKeysForLogging(
   return allKeys.sort()
 }
 
-// Flag to prevent infinite recursion when loading settings
-let isLoadingSettings = false
+function isSettingsLoadInProgress(): boolean {
+  return (
+    (globalThis as Record<string, unknown>)[
+      '__openclaudeSettingsLoadInProgress'
+    ] === true
+  )
+}
+
+function setSettingsLoadInProgress(value: boolean): void {
+  ;(globalThis as Record<string, unknown>)[
+    '__openclaudeSettingsLoadInProgress'
+  ] = value
+}
 
 /**
  * Load settings from disk without using cache
@@ -644,7 +656,7 @@ let isLoadingSettings = false
  */
 function loadSettingsFromDisk(): SettingsWithErrors {
   // Prevent recursive calls to loadSettingsFromDisk
-  if (isLoadingSettings) {
+  if (isSettingsLoadInProgress()) {
     return { settings: {}, errors: [] }
   }
 
@@ -652,7 +664,7 @@ function loadSettingsFromDisk(): SettingsWithErrors {
   profileCheckpoint('loadSettingsFromDisk_start')
   logForDiagnosticsNoPII('info', 'settings_load_started')
 
-  isLoadingSettings = true
+  setSettingsLoadInProgress(true)
   try {
     // Start with plugin settings as the lowest priority base.
     // All file-based sources (user, project, local, flag, policy) override these.
@@ -791,7 +803,7 @@ function loadSettingsFromDisk(): SettingsWithErrors {
 
     return { settings: mergedSettings, errors: allErrors }
   } finally {
-    isLoadingSettings = false
+    setSettingsLoadInProgress(false)
   }
 }
 
@@ -815,9 +827,12 @@ export function getInitialSettings(): SettingsJson {
 }
 
 /**
- * @deprecated Use getInitialSettings() instead. This alias exists for backwards compatibility.
+ * @deprecated Use getInitialSettings() instead. Keep this as a function
+ * declaration so cyclic test-only module graphs never observe it in TDZ.
  */
-export const getSettings_DEPRECATED = getInitialSettings
+export function getSettings_DEPRECATED(): SettingsJson {
+  return getInitialSettings()
+}
 
 export type SettingsWithSources = {
   effective: SettingsJson
@@ -885,6 +900,42 @@ export function hasSkipDangerousModePermissionPrompt(): boolean {
     getSettingsForSource('localSettings')?.skipDangerousModePermissionPrompt ||
     getSettingsForSource('flagSettings')?.skipDangerousModePermissionPrompt ||
     getSettingsForSource('policySettings')?.skipDangerousModePermissionPrompt
+  )
+}
+
+/**
+ * Returns true if any trusted settings source has accepted the full access
+ * mode dialog. This is intentionally separate from bypass permissions because
+ * fullAccess skips an additional hard safety-check layer.
+ */
+export function hasSkipFullAccessModePermissionPrompt(): boolean {
+  return !!(
+    getSettingsForSource('userSettings')
+      ?.skipFullAccessModePermissionPrompt ||
+    getSettingsForSource('localSettings')
+      ?.skipFullAccessModePermissionPrompt ||
+    getSettingsForSource('flagSettings')
+      ?.skipFullAccessModePermissionPrompt ||
+    getSettingsForSource('policySettings')
+      ?.skipFullAccessModePermissionPrompt
+  )
+}
+
+/**
+ * Returns true if any trusted settings source has enabled bypass permissions
+ * mode availability. projectSettings is intentionally excluded — a malicious
+ * project could otherwise enable bypass mode (security risk).
+ */
+export function hasAllowBypassPermissionsMode(): boolean {
+  return !!(
+    getSettingsForSource('userSettings')?.permissions
+      ?.allowBypassPermissionsMode ||
+    getSettingsForSource('localSettings')?.permissions
+      ?.allowBypassPermissionsMode ||
+    getSettingsForSource('flagSettings')?.permissions
+      ?.allowBypassPermissionsMode ||
+    getSettingsForSource('policySettings')?.permissions
+      ?.allowBypassPermissionsMode
   )
 }
 
