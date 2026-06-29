@@ -12,6 +12,12 @@ import {
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import {
+  CLINE_API_BASE_URL,
+  CLINE_DEFAULT_MODEL,
+  ensureClineModelPrefix,
+  isClineMode,
+} from './clineAuth.js'
+import {
   asTrimmedString,
   parseChatgptAccountId,
 } from './codexOAuthShared.js'
@@ -794,6 +800,30 @@ export function resolveProviderRequest(options?: {
   processEnv?: NodeJS.ProcessEnv
 }): ResolvedProviderRequest {
   const processEnv = options?.processEnv ?? process.env
+  if (isClineMode()) {
+    const requested =
+      options?.model?.trim() ||
+      processEnv.CLINE_MODEL?.trim() ||
+      processEnv.OPENAI_MODEL?.trim() ||
+      options?.fallbackModel?.trim() ||
+      CLINE_DEFAULT_MODEL
+    const clineDescriptor = parseModelDescriptor(requested)
+    const baseUrl = (
+      asEnvUrl(options?.baseUrl) ??
+      asEnvUrl(processEnv.OPENAI_BASE_URL) ??
+      CLINE_API_BASE_URL
+    ).replace(/\/+$/, '')
+    return {
+      transport: 'chat_completions',
+      requestedModel: requested,
+      resolvedModel: ensureClineModelPrefix(clineDescriptor.baseModel),
+      baseUrl,
+      reasoning: options?.reasoningEffortOverride
+        ? { effort: options.reasoningEffortOverride }
+        : clineDescriptor.reasoning,
+      thinking: clineDescriptor.thinking,
+    }
+  }
   const isGithubMode = isEnvTruthy(processEnv.CLAUDE_CODE_USE_GITHUB)
   const isMistralMode = isEnvTruthy(processEnv.CLAUDE_CODE_USE_MISTRAL)
   const isGeminiMode = isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI)

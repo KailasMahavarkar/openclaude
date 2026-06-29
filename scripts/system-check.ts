@@ -8,6 +8,11 @@ import {
   isLocalProviderUrl as isProviderLocalUrl,
 } from '../src/services/api/providerConfig.js'
 import {
+  getClineProvidersPath,
+  isClineMode,
+  tokenExpiryMs,
+} from '../src/services/api/clineAuth.js'
+import {
   getRouteCredentialEnvVars,
   getRouteCredentialValue,
   resolveActiveRouteIdFromEnv,
@@ -339,6 +344,9 @@ function hasPlaceholderCredential(value: string | undefined): boolean {
 }
 
 function currentBaseUrl(): string {
+  if (isClineMode()) {
+    return process.env.OPENAI_BASE_URL ?? 'https://api.cline.bot/api/v1'
+  }
   if (isTruthy(process.env.CLAUDE_CODE_USE_GEMINI)) {
     return process.env.GEMINI_BASE_URL ?? GEMINI_DEFAULT_BASE_URL
   }
@@ -428,12 +436,67 @@ function checkGithubEnv(): CheckResult[] {
   return results
 }
 
+function checkClineEnv(): CheckResult[] {
+  const results: CheckResult[] = []
+  const path = getClineProvidersPath()
+  results.push(pass('Provider mode', 'Cline subscription enabled.'))
+
+  if (!existsSync(path)) {
+    results.push(fail('Cline auth', `No Cline config at ${path}. Install and sign in to Cline.`))
+    return results
+  }
+
+  try {
+    const file = JSON.parse(readFileSync(path, 'utf8')) as {
+      lastUsedProvider?: string
+      providers?: Record<string, { settings?: { auth?: Record<string, unknown>; model?: string } }>
+    }
+    const providerId =
+      process.env.CLINE_PROVIDER_ID?.trim() || file.lastUsedProvider?.trim() || 'cline-pass'
+    const entry = file.providers?.[providerId]
+    const auth = entry?.settings?.auth as
+      | { accessToken?: string; refreshToken?: string; expiresAt?: number }
+      | undefined
+
+    if (!auth?.accessToken) {
+      results.push(fail('Cline auth', `No credentials for "${providerId}". Sign in to Cline.`))
+      return results
+    }
+
+    results.push(pass('Cline provider', providerId))
+    results.push(
+      pass('CLINE_MODEL', process.env.CLINE_MODEL ?? entry?.settings?.model ?? 'default (glm-5.2)'),
+    )
+
+    const expiry = tokenExpiryMs(auth)
+    if (expiry === undefined) {
+      results.push(pass('Cline token', 'Present (expiry unknown).'))
+    } else {
+      const minutes = Math.round((expiry - Date.now()) / 60_000)
+      if (minutes > 0) {
+        results.push(pass('Cline token', `Valid (~${minutes} min left; auto-refreshes).`))
+      } else if (auth.refreshToken) {
+        results.push(pass('Cline token', 'Expired; will refresh on next request.'))
+      } else {
+        results.push(fail('Cline token', 'Expired and no refresh token. Re-login via the Cline app.'))
+      }
+    }
+  } catch {
+    results.push(fail('Cline auth', `Could not parse ${path}.`))
+  }
+  return results
+}
+
 export function checkOpenAIEnv(): CheckResult[] {
   const results: CheckResult[] = []
   const useGemini = isTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
   const useGithub = isTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
   const useMistral = isTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)
   const useOpenAI = isTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
+
+  if (isClineMode()) {
+    return checkClineEnv()
+  }
 
   if (useGemini) {
     return checkGeminiEnv()
