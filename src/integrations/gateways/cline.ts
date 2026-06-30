@@ -60,22 +60,15 @@ export default defineGateway({
     missingCredentialMessage:
       'Sign in to Cline first (the app/CLI stores the token in ~/.cline/data/settings/providers.json).',
   },
+  // Models are read live from the installed Cline package (@cline/llms) at
+  // request time via the custom discovery hook - see services/api/clineModels.ts
+  // and discoveryService.ts. Cline ships no live /models endpoint.
   catalog: {
-    source: 'static',
-    models: [
-      {
-        id: 'cline-pass-glm-5-2',
-        apiName: 'cline-pass/glm-5.2',
-        label: 'GLM 5.2 (Cline)',
-        modelDescriptorId: 'glm-5.2',
-      },
-      {
-        id: 'cline-pass-deepseek-v4-pro',
-        apiName: 'cline-pass/deepseek-v4-pro',
-        label: 'DeepSeek V4 Pro (Cline)',
-        modelDescriptorId: 'deepseek-v4-pro',
-      },
-    ],
+    source: 'dynamic',
+    discovery: { kind: 'custom' },
+    discoveryCacheTtl: '1d',
+    discoveryRefreshMode: 'background-if-stale',
+    allowManualRefresh: true,
   },
   usage: { supported: false },
 })

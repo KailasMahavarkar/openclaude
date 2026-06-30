@@ -276,8 +276,15 @@ async function runDiscovery(
       return models?.map(model => toDiscoveredModelEntry(model)) ?? null
     }
 
-    case 'custom':
+    case 'custom': {
+      if (routeId === 'cline') {
+        const { loadClineCatalogModels } = await import(
+          '../services/api/clineModels.js'
+        )
+        return loadClineCatalogModels()
+      }
       return null
+    }
   }
 }
 
