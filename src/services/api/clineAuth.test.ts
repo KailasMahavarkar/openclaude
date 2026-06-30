@@ -9,7 +9,9 @@ import {
   ensureClineModelPrefix,
   getClineModelType,
   getClineProvidersPath,
+  isClineBaseUrl,
   resolveClineBearer,
+  shouldUseClineAuth,
   stripWorkosPrefix,
   tokenExpiryMs,
 } from './clineAuth.js'
@@ -72,6 +74,26 @@ function writeConfig(accessExp: number, opts?: { refresh?: string; lastUsed?: st
   writeFileSync(configPath, JSON.stringify(config, null, 2))
   return access
 }
+
+test('isClineBaseUrl matches the cline gateway host only', () => {
+  expect(isClineBaseUrl('https://api.cline.bot/api/v1')).toBe(true)
+  expect(isClineBaseUrl('https://api.cline.bot')).toBe(true)
+  expect(isClineBaseUrl('https://api.openai.com/v1')).toBe(false)
+  expect(isClineBaseUrl('https://evil.com/api.cline.bot')).toBe(false)
+  expect(isClineBaseUrl(undefined)).toBe(false)
+})
+
+test('shouldUseClineAuth triggers on flag or cline base url', () => {
+  delete process.env.CLAUDE_CODE_USE_CLINE
+  expect(shouldUseClineAuth('https://api.cline.bot/api/v1')).toBe(true)
+  expect(shouldUseClineAuth('https://api.openai.com/v1')).toBe(false)
+  process.env.CLAUDE_CODE_USE_CLINE = '1'
+  try {
+    expect(shouldUseClineAuth('https://api.openai.com/v1')).toBe(true)
+  } finally {
+    delete process.env.CLAUDE_CODE_USE_CLINE
+  }
+})
 
 test('workos prefix add/strip are idempotent', () => {
   expect(stripWorkosPrefix('workos:abc')).toBe('abc')
