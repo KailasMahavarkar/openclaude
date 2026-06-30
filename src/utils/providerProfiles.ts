@@ -937,6 +937,22 @@ export function applyActiveProviderProfileFromConfig(
   return activeProfile
 }
 
+/**
+ * Stable signature of a profile's content (everything except its id), so
+ * activating the same provider/config repeatedly reuses the saved profile
+ * instead of appending byte-identical duplicates.
+ */
+function profileContentSignature(profile: ProviderProfile): string {
+  const { id: _id, ...content } = profile
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(content)
+        .filter(([, value]) => value !== undefined)
+        .sort(([a], [b]) => a.localeCompare(b)),
+    ),
+  )
+}
+
 export function addProviderProfile(
   input: ProviderProfileInput,
   options?: { makeActive?: boolean },
@@ -947,11 +963,28 @@ export function addProviderProfile(
   }
 
   const makeActive = options?.makeActive ?? true
+  const signature = profileContentSignature(profile)
+  let resolvedProfile = profile
 
   saveGlobalConfig(current => {
     const currentProfiles = getProviderProfiles(current)
-    const nextProfiles = [...currentProfiles, profile]
     const currentActive = trimOrUndefined(current.activeProviderProfileId)
+
+    // Reuse an existing identical profile rather than appending a duplicate.
+    const duplicate = currentProfiles.find(
+      existing => profileContentSignature(existing) === signature,
+    )
+    if (duplicate) {
+      resolvedProfile = duplicate
+      const nextActiveId =
+        makeActive || !currentActive ||
+          !currentProfiles.some(p => p.id === currentActive)
+          ? duplicate.id
+          : currentActive
+      return { ...current, activeProviderProfileId: nextActiveId }
+    }
+
+    const nextProfiles = [...currentProfiles, profile]
     const nextActiveId =
       makeActive || !currentActive || !nextProfiles.some(p => p.id === currentActive)
         ? profile.id
@@ -965,12 +998,12 @@ export function addProviderProfile(
   })
 
   const activeProfile = getActiveProviderProfile()
-  if (activeProfile?.id === profile.id) {
-    setActiveProviderProfile(profile.id)
+  if (activeProfile?.id === resolvedProfile.id) {
+    setActiveProviderProfile(resolvedProfile.id)
     clearActiveOpenAIModelOptionsCache()
   }
 
-  return profile
+  return resolvedProfile
 }
 
 export function updateProviderProfile(
