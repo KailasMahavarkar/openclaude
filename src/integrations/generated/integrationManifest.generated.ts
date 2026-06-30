@@ -113,6 +113,18 @@ export const PROVIDER_PRESET_MANIFEST = [
     ]
   },
   {
+    "preset": "cline",
+    "routeKind": "gateway",
+    "routeId": "cline",
+    "vendorId": "openai",
+    "gatewayId": "cline",
+    "description": "Cline subscription (sign in to Cline, set CLAUDE_CODE_USE_CLINE=1)",
+    "modelEnvVars": [
+      "CLINE_MODEL",
+      "OPENAI_MODEL"
+    ]
+  },
+  {
     "preset": "deepseek",
     "routeKind": "vendor",
     "routeId": "deepseek",
@@ -444,6 +456,7 @@ export const ORDERED_PROVIDER_PRESETS = [
   "atlas-cloud",
   "azure-openai",
   "bankr",
+  "cline",
   "deepseek",
   "fireworks",
   "gemini",
