@@ -46,11 +46,17 @@ export default defineGateway({
     kind: 'credential-env',
     routing: {
       enablementEnvVar: 'CLAUDE_CODE_USE_CLINE',
+      // The /provider picker activates Cline by base URL (CLAUDE_CODE_USE_OPENAI
+      // + OPENAI_BASE_URL=api.cline.bot) without the flag, so match on the URL
+      // too - otherwise validation falls through to the OpenAI vendor, which
+      // demands an API key.
+      matchDefaultBaseUrl: true,
+      matchBaseUrlHosts: ['api.cline.bot'],
     },
     // Credentials live in ~/.cline/data/settings/providers.json, resolved and
     // refreshed at request time, so no env credential is required here.
     credentialEnvVars: [],
-    allowLocalBaseUrlWithoutCredential: true,
+    allowMissingCredential: true,
     missingCredentialMessage:
       'Sign in to Cline first (the app/CLI stores the token in ~/.cline/data/settings/providers.json).',
   },
