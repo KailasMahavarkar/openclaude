@@ -2933,3 +2933,47 @@ test('DEFAULT_MISTRAL_MODEL matches the mistral gateway defaultModel', async () 
   expect(mistralGateway.defaultModel).toBeDefined()
   expect(DEFAULT_MISTRAL_MODEL).toBe(mistralGateway.defaultModel!)
 })
+
+describe('addProviderProfile dedupe', () => {
+  test('reuses an identical profile instead of appending a duplicate', async () => {
+    const { addProviderProfile, getProviderProfiles } =
+      await importFreshProviderProfileModules()
+
+    const input = {
+      provider: 'cline' as const,
+      name: 'Cline',
+      baseUrl: 'https://api.cline.bot/api/v1',
+      model: 'cline-pass/glm-5.2',
+    }
+
+    const first = addProviderProfile(input, { makeActive: true })
+    const second = addProviderProfile(input, { makeActive: true })
+    const third = addProviderProfile(input, { makeActive: true })
+
+    const clineProfiles = getProviderProfiles().filter(
+      (p: ProviderProfile) => p.provider === 'cline',
+    )
+    expect(clineProfiles).toHaveLength(1)
+    expect(second?.id).toBe(first?.id)
+    expect(third?.id).toBe(first?.id)
+  })
+
+  test('still appends genuinely different profiles', async () => {
+    const { addProviderProfile, getProviderProfiles } =
+      await importFreshProviderProfileModules()
+
+    addProviderProfile(
+      { provider: 'cline', name: 'Cline', baseUrl: 'https://api.cline.bot/api/v1', model: 'cline-pass/glm-5.2' },
+      { makeActive: false },
+    )
+    addProviderProfile(
+      { provider: 'cline', name: 'Cline', baseUrl: 'https://api.cline.bot/api/v1', model: 'cline-pass/deepseek-v4-pro' },
+      { makeActive: false },
+    )
+
+    const clineProfiles = getProviderProfiles().filter(
+      (p: ProviderProfile) => p.provider === 'cline',
+    )
+    expect(clineProfiles).toHaveLength(2)
+  })
+})
