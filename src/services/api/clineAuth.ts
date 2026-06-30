@@ -58,6 +58,25 @@ export function isClineMode(): boolean {
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_CLINE)
 }
 
+/** True when a base URL targets the Cline gateway host. */
+export function isClineBaseUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === 'api.cline.bot'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Cline auth applies when explicitly enabled (CLAUDE_CODE_USE_CLINE) or
+ * whenever the active endpoint is the Cline gateway - e.g. the `/provider`
+ * picker activates Cline as an OpenAI-compatible route by base URL alone.
+ */
+export function shouldUseClineAuth(baseUrl: string | undefined): boolean {
+  return isClineMode() || isClineBaseUrl(baseUrl)
+}
+
 export function getClineProvidersPath(): string {
   const override = process.env.CLINE_CONFIG_PATH?.trim()
   if (override) return override
