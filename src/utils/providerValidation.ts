@@ -342,6 +342,11 @@ function getCredentialEnvValidationError(
     return null
   }
 
+  // Auth resolved externally (e.g. Cline's WorkOS token), not from an env key.
+  if (validation.allowMissingCredential) {
+    return null
+  }
+
   if (
     credentialEnvVars.some(envVar => hasUsableCredentialEnvValue(env, envVar))
   ) {

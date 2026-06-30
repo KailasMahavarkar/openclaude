@@ -231,6 +231,12 @@ export type ValidationMetadata =
       kind: 'credential-env'
       credentialEnvVars: string[]
       allowLocalBaseUrlWithoutCredential?: boolean
+      /**
+       * Pass validation even with no credential env var set. For providers
+       * whose auth is resolved at request time from an external source (e.g.
+       * the Cline WorkOS token in ~/.cline), not from an API key in env.
+       */
+      allowMissingCredential?: boolean
       missingCredentialMessage?: string
       invalidCredentialValues?: InvalidCredentialValue[]
     }
