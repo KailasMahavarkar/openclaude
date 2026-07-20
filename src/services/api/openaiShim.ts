@@ -3115,6 +3115,16 @@ class OpenAIShimMessages {
     if (reasoningRequestPlan.wireFormat === 'reasoning_effort' && reasoningRequestPlan.reasoningEffort) {
       body.reasoning_effort = reasoningRequestPlan.reasoningEffort
     }
+    // The Cline gateway (api.cline.bot) controls reasoning with a `reasoning`
+    // object ({ enabled, effort }), not the top-level `reasoning_effort` field
+    // used by OpenAI/Codex. Its effort ladder tops out at "high", so xhigh maps
+    // down. See how Cline itself sends this in @cline/llms.
+    if (shouldUseClineAuth(request.baseUrl) && request.reasoning?.effort) {
+      const clineEffort =
+        request.reasoning.effort === 'xhigh' ? 'high' : request.reasoning.effort
+      body.reasoning = { enabled: true, effort: clineEffort }
+      delete body.reasoning_effort
+    }
     // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
     // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.
     // Ensure max_tokens is a valid positive number before using it.
