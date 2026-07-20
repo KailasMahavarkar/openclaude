@@ -408,6 +408,56 @@ test('nests reasoning effort for OpenAI-compatible responses endpoint', async ()
   expect(capturedBody).not.toHaveProperty('reasoning_summary')
 })
 
+test('emits a reasoning object (not reasoning_effort) for the Cline gateway', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256' })).toString('base64url')
+  const payload = Buffer.from(
+    JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600, client_id: 'c' }),
+  ).toString('base64url')
+  const dir = mkdtempSync(join(tmpdir(), 'cline-shim-'))
+  const cfg = join(dir, 'providers.json')
+  writeFileSync(cfg, JSON.stringify({
+    lastUsedProvider: 'cline-pass',
+    providers: {
+      'cline-pass': {
+        settings: {
+          provider: 'cline-pass',
+          model: 'cline-pass/glm-5.2',
+          auth: { accessToken: `workos:${header}.${payload}.sig`, refreshToken: 'r' },
+        },
+      },
+    },
+  }))
+  process.env.CLINE_CONFIG_PATH = cfg
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.cline.bot/api/v1'
+
+  let capturedBody: Record<string, unknown> | undefined
+  globalThis.fetch = (async (_input, init) => {
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(
+      JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: {} }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'xhigh' }) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'cline-pass/glm-5.2',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  // xhigh maps to Cline's max supported level, "high".
+  expect(capturedBody?.reasoning).toEqual({ enabled: true, effort: 'high' })
+  expect(capturedBody).not.toHaveProperty('reasoning_effort')
+
+  delete process.env.CLINE_CONFIG_PATH
+})
+
 test('uses OpenAI-compatible responses endpoint with text chunk types when OPENAI_API_FORMAT=responses_compat', async () => {
   process.env.OPENAI_API_FORMAT = 'responses_compat'
   let capturedUrl = ''
