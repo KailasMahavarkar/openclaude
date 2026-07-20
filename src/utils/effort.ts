@@ -142,7 +142,8 @@ function metadataWireFormatSupportsEffort(
 ): boolean {
   return wireFormat === 'reasoning_effort' ||
     wireFormat === 'deepseek_compatible' ||
-    wireFormat === 'zai_compatible'
+    wireFormat === 'zai_compatible' ||
+    wireFormat === 'reasoning_object'
 }
 
 function normalizedBaseModel(model: string | undefined): string {
@@ -229,6 +230,11 @@ function resolveCompatibilityWireFormat(
   if (!routeId || routeId === 'anthropic' || routeId === 'openai') {
     return undefined
   }
+  // Cline routes every model through its gateway's `reasoning` object, which
+  // accepts the full effort ladder regardless of the underlying model family.
+  if (routeId === 'cline') {
+    return 'reasoning_object'
+  }
   if (modelLooksDeepSeekCompatible(model)) {
     return 'deepseek_compatible'
   }
@@ -291,6 +297,18 @@ function resolveCompatibilityReasoningControl(
       controllable: true,
       mode: 'levels',
       levels,
+      defaultLevel: undefined,
+      wireFormat,
+      source: 'compat',
+    }
+  }
+
+  if (wireFormat === 'reasoning_object') {
+    return {
+      supportsReasoning: true,
+      controllable: true,
+      mode: 'levels',
+      levels: ['low', 'medium', 'high', 'xhigh'],
       defaultLevel: undefined,
       wireFormat,
       source: 'compat',
