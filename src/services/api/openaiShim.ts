@@ -3117,12 +3117,10 @@ class OpenAIShimMessages {
     }
     // The Cline gateway (api.cline.bot) controls reasoning with a `reasoning`
     // object ({ enabled, effort }), not the top-level `reasoning_effort` field
-    // used by OpenAI/Codex. Its effort ladder tops out at "high", so xhigh maps
-    // down. See how Cline itself sends this in @cline/llms.
+    // used by OpenAI/Codex. Cline accepts the full low/medium/high/xhigh ladder,
+    // so pass the effort through unchanged (xhigh stays distinct from high).
     if (shouldUseClineAuth(request.baseUrl) && request.reasoning?.effort) {
-      const clineEffort =
-        request.reasoning.effort === 'xhigh' ? 'high' : request.reasoning.effort
-      body.reasoning = { enabled: true, effort: clineEffort }
+      body.reasoning = { enabled: true, effort: request.reasoning.effort }
       delete body.reasoning_effort
     }
     // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.

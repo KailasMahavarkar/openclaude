@@ -451,8 +451,8 @@ test('emits a reasoning object (not reasoning_effort) for the Cline gateway', as
     stream: false,
   })
 
-  // xhigh maps to Cline's max supported level, "high".
-  expect(capturedBody?.reasoning).toEqual({ enabled: true, effort: 'high' })
+  // Cline accepts the full ladder; effort passes through unchanged (xhigh != high).
+  expect(capturedBody?.reasoning).toEqual({ enabled: true, effort: 'xhigh' })
   expect(capturedBody).not.toHaveProperty('reasoning_effort')
 
   delete process.env.CLINE_CONFIG_PATH
