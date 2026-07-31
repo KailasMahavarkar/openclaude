@@ -114,6 +114,9 @@ function loadRawModels(providerId: string): RawClineModel[] | null {
 function toCatalogEntry(model: RawClineModel): ModelCatalogEntry | null {
   const apiName = model.id?.trim()
   if (!apiName) return null
+  // `cline-free/*` models are "only available via Cline product surfaces" - the
+  // API returns 403 for them, so they are not usable from openclaude. Drop them.
+  if (apiName.toLowerCase().startsWith('cline-free/')) return null
   const name = model.name?.trim() || apiName
   // Cline exposes both a paid and a free variant of some models (e.g.
   // cline-pass/deepseek-v4-flash vs deepseek/deepseek-v4-flash) under the same
