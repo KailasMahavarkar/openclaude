@@ -77,6 +77,21 @@ export function shouldUseClineAuth(baseUrl: string | undefined): boolean {
   return isClineMode() || isClineBaseUrl(baseUrl)
 }
 
+/**
+ * Headers that identify the request as coming from a Cline SDK surface. Cline's
+ * gateway restricts some models (e.g. the `cline-free/*` tier) to its own
+ * product surfaces; `X-CLIENT-TYPE: cline-sdk` is what unlocks them. This makes
+ * openclaude a faithful passthrough for the logged-in Cline account.
+ */
+export function getClineRequestHeaders(): Record<string, string> {
+  return {
+    'HTTP-Referer': 'https://cline.bot',
+    'X-Title': 'Cline',
+    'X-CLIENT-TYPE': 'cline-sdk',
+    'X-IS-MULTIROOT': 'false',
+  }
+}
+
 export function getClineProvidersPath(): string {
   const override = process.env.CLINE_CONFIG_PATH?.trim()
   if (override) return override
