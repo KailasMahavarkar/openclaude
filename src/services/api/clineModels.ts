@@ -14,7 +14,6 @@ import { delimiter, dirname, join } from 'node:path'
 
 import type { ModelCatalogEntry } from '../../integrations/descriptors.js'
 import { logForDebugging } from '../../utils/debug.js'
-import { getClineModelType } from './clineAuth.js'
 
 type RawClineModel = {
   id?: string
@@ -139,8 +138,11 @@ let cached: ModelCatalogEntry[] | null = null
  */
 export function loadClineCatalogModels(): ModelCatalogEntry[] {
   if (cached) return cached
-  const providerId = getClineModelType()
-  const raw = loadRawModels(providerId) ?? loadRawModels('cline-pass')
+  // Always load the `cline-pass` collection - Cline's full subscription catalog
+  // (paid + free models). Do NOT derive the collection from the active model's
+  // namespace: a free model like `deepseek/deepseek-v4-flash` would otherwise
+  // pull the deepseek vendor catalog instead of Cline's list.
+  const raw = loadRawModels('cline-pass') ?? loadRawModels('cline')
   const live = raw
     ?.map(toCatalogEntry)
     .filter((entry): entry is ModelCatalogEntry => entry !== null)

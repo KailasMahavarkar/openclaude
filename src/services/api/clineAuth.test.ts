@@ -129,8 +129,10 @@ test('getClineProvidersPath honors override then CLINE_DIR then default', () => 
   expect(getClineProvidersPath()).toBe('/custom/cline/data/settings/providers.json')
 })
 
-test('getClineModelType derives namespace from stored model', () => {
-  writeConfig(Math.floor(Date.now() / 1000) + 3600, { model: 'cline-pass/deepseek-v4-pro' })
+test('getClineModelType defaults to cline-pass, honors override', () => {
+  // Even when the active model is a non-cline-pass (free) namespace, bare model
+  // ids must still resolve under cline-pass.
+  writeConfig(Math.floor(Date.now() / 1000) + 3600, { model: 'deepseek/deepseek-v4-flash' })
   expect(getClineModelType()).toBe('cline-pass')
   process.env.CLINE_MODEL_TYPE = 'override-type'
   expect(getClineModelType()).toBe('override-type')
