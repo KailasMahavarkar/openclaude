@@ -66,7 +66,10 @@ export default defineGateway({
   catalog: {
     source: 'dynamic',
     discovery: { kind: 'custom' },
-    discoveryCacheTtl: '1d',
+    // The catalog is read from the local @cline/llms package (instant), so keep
+    // the cache short - it just needs to track the installed Cline version, and
+    // a long TTL leaves stale labels/models around after a Cline update.
+    discoveryCacheTtl: '5m',
     discoveryRefreshMode: 'background-if-stale',
     allowManualRefresh: true,
   },
