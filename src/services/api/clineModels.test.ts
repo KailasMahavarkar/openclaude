@@ -10,16 +10,25 @@ afterEach(() => {
   process.env.PATH = originalPath
 })
 
-test('loadClineCatalogModels returns cline-pass namespaced entries', () => {
+test('loadClineCatalogModels returns namespaced entries', () => {
   const models = loadClineCatalogModels()
   expect(models.length).toBeGreaterThanOrEqual(2)
   for (const model of models) {
     expect(model.apiName).toBe(model.id)
-    expect(model.apiName.startsWith('cline-pass/')).toBe(true)
+    // Every model is namespaced (paid cline-pass/... or a free vendor prefix).
+    expect(model.apiName.includes('/')).toBe(true)
     expect(typeof model.label).toBe('string')
+    expect(model.label!.length).toBeGreaterThan(0)
   }
   // glm-5.2 is always present (live catalog or fallback snapshot)
   expect(models.some(m => m.apiName === 'cline-pass/glm-5.2')).toBe(true)
+})
+
+test('free-model labels are not double-tagged', () => {
+  const models = loadClineCatalogModels()
+  for (const model of models) {
+    expect(model.label).not.toMatch(/\(free\).*\(free\)/i)
+  }
 })
 
 test('falls back to the bundled snapshot when the Cline package is unresolvable', () => {

@@ -21,6 +21,11 @@ type RawClineModel = {
   name?: string
   contextWindow?: number
   maxTokens?: number
+  pricing?: { input?: number; output?: number }
+}
+
+function isFreeModel(model: RawClineModel): boolean {
+  return model.pricing?.input === 0 && model.pricing?.output === 0
 }
 
 type ClineLlmsModule = {
@@ -40,6 +45,11 @@ const FALLBACK_MODELS: ModelCatalogEntry[] = [
   { id: 'cline-pass/minimax-m3', apiName: 'cline-pass/minimax-m3', label: 'MiniMax-M3', contextWindow: 524_288, maxOutputTokens: 512_000 },
   { id: 'cline-pass/mimo-v2.5', apiName: 'cline-pass/mimo-v2.5', label: 'MiMo-V2.5', contextWindow: 32_000, maxOutputTokens: 131_072 },
   { id: 'cline-pass/mimo-v2.5-pro', apiName: 'cline-pass/mimo-v2.5-pro', label: 'MiMo-V2.5-Pro', contextWindow: 1_048_576, maxOutputTokens: 131_072 },
+  { id: 'cline-pass/kimi-k3', apiName: 'cline-pass/kimi-k3', label: 'Kimi K3' },
+  // Free tier (work via streaming, which openclaude always uses):
+  { id: 'stepfun/step-3.7-flash', apiName: 'stepfun/step-3.7-flash', label: 'Step 3.7 Flash (free)' },
+  { id: 'poolside/laguna-m.1:free', apiName: 'poolside/laguna-m.1:free', label: 'Laguna M.1 (free)' },
+  { id: 'deepseek/deepseek-v4-flash', apiName: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash (free)' },
 ]
 
 const require = createRequire(import.meta.url)
@@ -105,10 +115,17 @@ function loadRawModels(providerId: string): RawClineModel[] | null {
 function toCatalogEntry(model: RawClineModel): ModelCatalogEntry | null {
   const apiName = model.id?.trim()
   if (!apiName) return null
+  const name = model.name?.trim() || apiName
+  // Cline exposes both a paid and a free variant of some models (e.g.
+  // cline-pass/deepseek-v4-flash vs deepseek/deepseek-v4-flash) under the same
+  // display name. Tag free ones so the picker shows distinct labels - but don't
+  // double-tag when the name already says "free".
+  const label =
+    isFreeModel(model) && !/free/i.test(name) ? `${name} (free)` : name
   return {
     id: apiName,
     apiName,
-    label: model.name?.trim() || apiName,
+    label,
     contextWindow: model.contextWindow,
     maxOutputTokens: model.maxTokens,
   }
