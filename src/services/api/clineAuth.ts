@@ -149,19 +149,14 @@ function selectProviderId(file: ClineProvidersFile): string {
   return CLINE_DEFAULT_MODEL_TYPE
 }
 
-/** Model namespace for the active Cline provider (e.g. "cline-pass"). */
+/**
+ * Namespace to prefix onto a bare model id (e.g. "glm-5.2" -> "cline-pass/…").
+ * Defaults to "cline-pass" (the subscription). We deliberately do NOT derive it
+ * from the active model's prefix - a free model like `deepseek/deepseek-v4-flash`
+ * would otherwise make bare models resolve to the wrong namespace.
+ */
 export function getClineModelType(): string {
-  const override = process.env.CLINE_MODEL_TYPE?.trim()
-  if (override) return override
-  try {
-    const file = readProvidersFile(getClineProvidersPath())
-    const entry = file.providers?.[selectProviderId(file)]
-    const stored = entry?.settings?.model
-    if (stored && stored.includes('/')) return stored.split('/', 1)[0]
-  } catch {
-    /* fall back to default */
-  }
-  return CLINE_DEFAULT_MODEL_TYPE
+  return process.env.CLINE_MODEL_TYPE?.trim() || CLINE_DEFAULT_MODEL_TYPE
 }
 
 /** Ensure a model id carries the `<modelType>/` namespace Cline requires. */
