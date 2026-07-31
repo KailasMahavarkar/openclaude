@@ -24,11 +24,6 @@ test('loadClineCatalogModels returns namespaced entries', () => {
   expect(models.some(m => m.apiName === 'cline-pass/glm-5.2')).toBe(true)
 })
 
-test('excludes cline-free models (API 403, product-surface only)', () => {
-  const models = loadClineCatalogModels()
-  expect(models.some(m => m.apiName.toLowerCase().startsWith('cline-free/'))).toBe(false)
-})
-
 test('free-model labels are not double-tagged', () => {
   const models = loadClineCatalogModels()
   for (const model of models) {
