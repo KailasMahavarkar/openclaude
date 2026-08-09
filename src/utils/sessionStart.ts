@@ -6,7 +6,11 @@ import { withDiagnosticsTiming } from './diagLogs.js'
 import { isBareMode } from './envUtils.js'
 import { updateWatchPaths } from './hooks/fileChangedWatcher.js'
 import { shouldAllowManagedHooksOnly } from './hooks/hooksConfigSnapshot.js'
-import { executeSessionStartHooks, executeSetupHooks } from './hooks.js'
+import {
+  executeSessionStartHooks,
+  executeSetupHooks,
+  orderHookContextsForCache,
+} from './hooks.js'
 import { logError } from './log.js'
 import { loadPluginHooks } from './plugins/loadPluginHooks.js'
 
@@ -163,7 +167,7 @@ export async function processSessionStartHooks(
   if (additionalContexts.length > 0) {
     const contextMessage = createAttachmentMessage({
       type: 'hook_additional_context',
-      content: additionalContexts,
+      content: orderHookContextsForCache(additionalContexts),
       hookName: 'SessionStart',
       toolUseID: 'SessionStart',
       hookEvent: 'SessionStart',
@@ -220,7 +224,7 @@ export async function processSetupHooks(
   if (additionalContexts.length > 0) {
     const contextMessage = createAttachmentMessage({
       type: 'hook_additional_context',
-      content: additionalContexts,
+      content: orderHookContextsForCache(additionalContexts),
       hookName: 'Setup',
       toolUseID: 'Setup',
       hookEvent: 'Setup',

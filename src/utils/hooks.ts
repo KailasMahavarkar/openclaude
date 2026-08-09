@@ -545,6 +545,26 @@ export interface HookResult {
   hook: HookCommand | HookCallback | FunctionHook
 }
 
+/**
+ * Order hook-supplied context blocks deterministically.
+ *
+ * Hooks are consumed from an async generator, so the blocks arrive in
+ * completion order - two SessionStart hooks race and land in a different order
+ * on every run. They are concatenated into one attachment near the very front
+ * of the request, so an unstable order invalidates the prompt cache almost
+ * immediately and forces a full re-prefill each session. Measured against a
+ * local server with two SessionStart hooks installed: the blocks swapped at
+ * char 3,478 of a 62,594-char message, re-processing ~94% of it (~14.8K tokens)
+ * every run.
+ *
+ * Blocks are independent, so their relative order carries no meaning and
+ * sorting is free. Code-unit comparison, not localeCompare, which is ICU and
+ * locale dependent and so not stable across machines.
+ */
+export function orderHookContextsForCache(contexts: string[]): string[] {
+  return [...contexts].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+}
+
 export type AggregatedHookResult = {
   message?: HookResultMessage
   blockingError?: HookBlockingError
