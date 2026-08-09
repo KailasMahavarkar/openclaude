@@ -43,6 +43,7 @@ import {
   getActiveProviderProfile,
   getProfileModelOptions,
 } from '../providerProfiles.js'
+import { getCachedLocalModelOptions, isLocalProvider } from './localModels.js'
 import { getCachedOllamaModelOptions, isOllamaProvider } from './ollamaModels.js'
 import { getCachedNvidiaNimModelOptions, isNvidiaNimProvider } from './nvidiaNimModels.js'
 import { getCachedMiniMaxModelOptions, isMiniMaxProvider } from './minimaxModels.js'
@@ -419,6 +420,32 @@ function getCopilotModelOptions(): ModelOption[] {
 function getModelOptionsBase(fastMode = false): ModelOption[] {
   if (getAPIProvider() === 'github') {
     return [getDefaultOptionForUser(fastMode), ...getCopilotModelOptions()]
+  }
+
+  // A local server is checked before the hosted catalogues: when a model is running on
+  // this machine it is the zero-cost, zero-latency, fully private option, so it heads
+  // the picker. Gated on the 'openai' provider like Ollama is, because a local server
+  // IS the OpenAI transport - it is a catalogue distinction, not a protocol one.
+  if (getAPIProvider() === 'openai' && isLocalProvider()) {
+    const defaultOption = getDefaultOptionForUser(fastMode)
+    const localModels = getCachedLocalModelOptions()
+    if (localModels.length > 0) {
+      return [defaultOption, ...localModels]
+    }
+    // Discovery has not landed yet (or the server is down): keep whatever model the user
+    // configured selectable instead of dropping them into the Claude catalogue.
+    const currentModel = getUserSpecifiedModelSetting() ?? getInitialMainLoopModel()
+    if (currentModel != null) {
+      return [
+        defaultOption,
+        {
+          value: currentModel,
+          label: currentModel,
+          description: 'Currently configured local model',
+        },
+      ]
+    }
+    return [defaultOption]
   }
 
   // When using Ollama, show models from the Ollama server instead of Claude models

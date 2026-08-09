@@ -36,6 +36,7 @@ import { launchRepl } from './replLauncher.js';
 import { refreshGrowthBookAfterAuthChange } from './services/analytics/growthbook.js';
 import { fetchBootstrapData } from './services/api/bootstrap.js';
 import { refreshStartupDiscoveryForActiveRoute } from './integrations/discoveryService.js';
+import { prefetchLocalModels } from './utils/model/localModels.js';
 import { prefetchOllamaModels } from './utils/model/ollamaModels.js';
 import { type DownloadResult, downloadSessionFiles, type FilesApiConfig, parseFileSpecs } from './services/api/filesApi.js';
 import { prefetchPassesEligibility } from './services/api/referral.js';
@@ -2293,6 +2294,9 @@ async function run(): Promise<CommanderCommand> {
     const skipStartupPrefetches = isBareMode() || bgRefreshThrottleMs > 0 && Date.now() - lastPrefetched < bgRefreshThrottleMs;
     // Always prefetch Ollama models (not gated by throttle — local server, fast & cheap)
     prefetchOllamaModels();
+    // Same reasoning for a local OpenAI-compatible server: loopback discovery is cheap,
+    // and it must be ready before the first /model render for local models to lead it.
+    prefetchLocalModels();
     void refreshStartupDiscoveryForActiveRoute();
 
     if (!skipStartupPrefetches) {
