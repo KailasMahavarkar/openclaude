@@ -2734,8 +2734,23 @@ async function getSkillListingAttachments(
     return []
   }
 
-  // Find skills we haven't sent yet
-  const newSkills = allCommands.filter(cmd => !sent.has(cmd.name))
+  // Find skills we haven't sent yet, in a stable order.
+  //
+  // Sorting is what makes this listing byte-identical between runs. The source
+  // order is plugin/directory load order, which varies run to run, and the
+  // listing sits ~37K chars into the request - so an unsorted list invalidates
+  // the prompt cache from that point on and forces a re-prefill of everything
+  // after it on every session. Measured against a local server: 62 reordered
+  // regions, ~9.3K tokens re-processed per run.
+  //
+  // Safe to reorder: formatCommandsWithinBudget never selects or drops by
+  // position, it only trims descriptions, so ordering changes what the list
+  // looks like and not which skills it contains. Code-unit comparison rather
+  // than localeCompare, which is ICU/locale dependent and so not stable across
+  // machines.
+  const newSkills = allCommands
+    .filter(cmd => !sent.has(cmd.name))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
 
   if (newSkills.length === 0) {
     return []

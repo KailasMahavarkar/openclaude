@@ -54,7 +54,10 @@ import {
 } from '../../utils/forkedAgent.js'
 import { registerFrontmatterHooks } from '../../utils/hooks/registerFrontmatterHooks.js'
 import { clearSessionHooks } from '../../utils/hooks/sessionHooks.js'
-import { executeSubagentStartHooks } from '../../utils/hooks.js'
+import {
+  executeSubagentStartHooks,
+  orderHookContextsForCache,
+} from '../../utils/hooks.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { getAgentModel } from '../../utils/model/agent.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
@@ -583,7 +586,7 @@ export async function* runAgent({
   if (additionalContexts.length > 0) {
     const contextMessage = createAttachmentMessage({
       type: 'hook_additional_context',
-      content: additionalContexts,
+      content: orderHookContextsForCache(additionalContexts),
       hookName: 'SubagentStart',
       toolUseID: randomUUID(),
       hookEvent: 'SubagentStart',
