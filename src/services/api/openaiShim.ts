@@ -38,7 +38,7 @@ import {
 } from '../../utils/codexCredentials.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isBareMode, isEnvTruthy } from '../../utils/envUtils.js'
-import { getClineRequestHeaders, resolveClineBearer, shouldUseClineAuth } from './clineAuth.js'
+import { resolveClineBearer, shouldUseClineAuth } from './clineAuth.js'
 import {
   resolveModelReasoningControl,
   resolveOpenAIShimReasoningRequestPlan,
@@ -3641,11 +3641,6 @@ class OpenAIShimMessages {
       credentialLease: CredentialLease | null,
     ): Promise<Record<string, string>> => {
       const headers: Record<string, string> = { ...baseHeaders }
-      // Present as a Cline SDK surface so the gateway serves every model the
-      // account can use, including the product-surface-gated cline-free tier.
-      if (shouldUseClineAuth(request.baseUrl)) {
-        Object.assign(headers, getClineRequestHeaders())
-      }
       const authValue =
         explicitCustomAuthHeaderValue ||
         refreshedCopilotToken ||

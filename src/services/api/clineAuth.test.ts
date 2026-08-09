@@ -6,7 +6,6 @@ import { join } from 'node:path'
 import {
   addWorkosPrefix,
   decodeJwtPayload,
-  getClineRequestHeaders,
   ensureClineModelPrefix,
   getClineModelType,
   getClineProvidersPath,
@@ -186,11 +185,4 @@ test('resolveClineBearer surfaces a clear error on refresh failure', async () =>
 test('resolveClineBearer errors when not signed in', async () => {
   writeFileSync(configPath, JSON.stringify({ version: 1, providers: {} }))
   await expect(resolveClineBearer()).rejects.toThrow(/No Cline credentials/)
-})
-
-test('getClineRequestHeaders marks the request as a Cline SDK surface', () => {
-  const h = getClineRequestHeaders()
-  expect(h['X-CLIENT-TYPE']).toBe('cline-sdk')
-  expect(h['HTTP-Referer']).toBe('https://cline.bot')
-  expect(h['X-Title']).toBe('Cline')
 })
